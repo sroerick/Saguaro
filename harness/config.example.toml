@@ -1,0 +1,36 @@
+# Copy to bridge.toml (chmod 600) and fill in. Never commit the real one.
+
+[bridge]
+jid = "agent@chat.example.net"
+password_file = "/home/agent/opencliwsp/xmpp.password"   # one line, 0600
+allow = ["owner@chat.example.net"]        # 1:1 senders the bridge obeys
+allow_domain = ""                          # optional: trust a whole domain
+mucs = ["ops@conference.chat.example.net"] # rooms to join (muc_send/history must match)
+muc_nick = "agent"                         # our nick in rooms
+muc_trigger = "agent"                      # respond only to "@agent ..." mentions in rooms
+owner_name = "the owner"                   # used in the HEARTBEAT prompt
+pane = "alagent"                           # tmux pane the picker watcher watches
+start_script = ""                          # boot/watchdog entrypoint; empty = repo start-sessions.sh
+
+[autolith]
+bin = "/home/agent/.local/bin/autolith"
+session_id = "auto"                        # or a fixed localgroup session id
+conv = ""                                  # standing conversation id to resume at boot
+conversations_dir = ""                     # default: ~/.local/share/autolith/conversations
+turn_timeout_secs = 900
+poll_secs = 1.5
+max_reply_chars = 8000
+
+# --- optional: Pricklypear-backed memory (default off) -----------------
+# The agent's persistent memory works with no Pricklypear at all (autolith
+# native memory). If you run a Pricklypear habitat and want the agent's
+# memories mirrored there as durable rows -- visible to habitat-side
+# agents, with row history -- enable the mirror. Writes land locally
+# first and graft to the habitat on a cron drain, so losing connectivity
+# never loses a memory.
+#[memory]
+#pp_mirror  = "off"          # off | on
+#pp_url     = ""             # your habitat base URL
+#pp_user    = "agent"        # HTTP-basic user for /api/eval
+#pp_token   = ""             # prefer env PP_TOKEN; never commit this file
+#graft_cron = "*/10 * * * *" # drain cadence, see RUNBOOK section 7

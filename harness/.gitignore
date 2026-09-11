@@ -1,0 +1,7 @@
+bridge.toml
+xmpp.password
+*.log
+venv/
+__pycache__/
+*.tgz
+AGENTS.md
