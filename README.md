@@ -36,7 +36,7 @@ key (RUNBOOK section 7).
 Short version; details in RUNBOOK.md:
 
     curl -fsSL https://sh.lambda-symbolics.com/autolith | sh   # the engine
-    python3 -m venv harness/venv && harness/venv/bin/pip install -r harness/requirements.txt
+    python3 -m venv harness/venv && harness/venv/bin/pip install --no-deps -r harness/requirements.txt  # why --no-deps: see note in requirements.txt
     cp harness/config.example.toml harness/config.toml         # fill in JID + password
     harness/start-sessions.sh                                  # tmux + bridge
     crontab harness/crontab.example                            # heartbeat + watchdog
