@@ -1,1 +1,7 @@
+# slixmpp 1.17.0 declares aiodns and pyasn1-modules, but a direct-host
+# XMPP connection needs neither, and aiodns (pycares) fails to build on
+# OpenBSD. Install with --no-deps; these are the exact working set
+# running in production.
 slixmpp==1.17.0
+pyasn1==0.6.4
+typing_extensions==4.16.0

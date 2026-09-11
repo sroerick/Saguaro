@@ -38,7 +38,7 @@ config.toml.
 
     cd saguaro
     python3 -m venv harness/venv
-    harness/venv/bin/pip install -r harness/requirements.txt
+    harness/venv/bin/pip install --no-deps -r harness/requirements.txt  # why --no-deps: see note in requirements.txt
     cp harness/config.example.toml harness/config.toml && chmod 600 harness/config.toml
 
 Fill in: the agent JID + password_file path, your JID as the owner, the
