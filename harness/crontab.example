@@ -1,0 +1,3 @@
+# user crontab (crontab -e). Adjust paths to your checkout.
+13 * * * * /home/agent/xmpp-bridge/venv/bin/python /home/agent/xmpp-bridge/heartbeat.py >> /home/agent/xmpp-bridge/heartbeat.log 2>&1
+*/5 * * * * /home/agent/xmpp-bridge/venv/bin/python /home/agent/xmpp-bridge/watchdog.py >> /home/agent/xmpp-bridge/watchdog.log 2>&1
