@@ -11,7 +11,7 @@ import asyncio, json, os, re, subprocess, tomllib
 from pathlib import Path
 import slixmpp
 
-CFG_PATH = Path(os.environ.get("BRIDGE_CONFIG", str(Path(__file__).resolve().parent / "bridge.toml")))
+CFG_PATH = Path(os.environ.get("BRIDGE_CONFIG", str(Path(__file__).resolve().parent / "config.toml")))
 cfg = tomllib.loads(CFG_PATH.read_text())
 A = cfg["autolith"]; B = cfg["bridge"]
 
