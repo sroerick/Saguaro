@@ -4,7 +4,7 @@
 Usage: muc_send.py ROOM_JID TEXT [TEXT...]
   e.g. muc_send.py ops-test@conference.chat.example.net "hello room"
 
-ROOM_JID must be listed under [bridge] mucs in bridge.toml (that list is
+ROOM_JID must be listed under [bridge] mucs in config.toml (that list is
 the authorization boundary). Slixmpp 1.17: one-shot under asyncio.run, clean disconnect.
 """
 import asyncio
@@ -17,7 +17,7 @@ import slixmpp
 
 CFG = tomllib.loads(Path(
     os.environ.get("BRIDGE_CONFIG",
-                   str(Path(__file__).resolve().parent / "bridge.toml"))).read_text())
+                   str(Path(__file__).resolve().parent / "config.toml"))).read_text())
 B = CFG["bridge"]
 MUCS = [m for m in B.get("mucs", []) if m]
 NICK = B.get("muc_nick", "agent")
@@ -41,7 +41,7 @@ class Poster(slixmpp.ClientXMPP):
             self.done.set()
             return
         if ROOM not in MUCS:
-            print("room %s not in bridge.toml mucs: %s" % (ROOM, ", ".join(MUCS)))
+            print("room %s not in config.toml mucs: %s" % (ROOM, ", ".join(MUCS)))
             self.done.set()
             return
         try:

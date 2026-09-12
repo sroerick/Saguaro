@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate the agent persona file (AGENTS.md) from persona.tmpl.md.
 
-Fills {{OWNER}}, {{AGENT}}, {{HOST}} from bridge.toml (owner_name, muc_nick,
+Fills {{OWNER}}, {{AGENT}}, {{HOST}} from config.toml (owner_name, muc_nick,
 the jid's host). Refuses to overwrite: after first generation the file belongs
 to the user; edit it in place and the generator leaves it alone.
 
@@ -14,7 +14,7 @@ import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-CFG = Path(os.environ.get("BRIDGE_CONFIG", str(ROOT / "bridge.toml")))
+CFG = Path(os.environ.get("BRIDGE_CONFIG", str(ROOT / "config.toml")))
 OUT = Path(sys.argv[1] if len(sys.argv) > 1
            else os.environ.get("AGENTS_MD", str(Path.home() / "AGENTS.md")))
 

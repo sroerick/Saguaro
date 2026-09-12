@@ -5,7 +5,7 @@ view, straight from the XMPP server (not any mirror/branch/worker copy).
 Usage: muc_history.py ROOM_JID [MAX_STANZAS]
   e.g. muc_history.py ops-test@conference.chat.example.net 50
 
-ROOM_JID must be listed under [bridge] mucs in bridge.toml. Prints
+ROOM_JID must be listed under [bridge] mucs in config.toml. Prints
 "[HH:MM] nick: body" in arrival order. Slixmpp 1.17: one-shot under asyncio.run, clean disconnect.
 """
 import asyncio
@@ -18,7 +18,7 @@ import slixmpp
 
 CFG = tomllib.loads(Path(
     os.environ.get("BRIDGE_CONFIG",
-                   str(Path(__file__).resolve().parent / "bridge.toml"))).read_text())
+                   str(Path(__file__).resolve().parent / "config.toml"))).read_text())
 B = CFG["bridge"]
 MUCS = [m for m in B.get("mucs", []) if m]
 NICK = B.get("muc_nick", "agent")
@@ -38,7 +38,7 @@ class Reader(slixmpp.ClientXMPP):
         global ok
         try:
             if ROOM not in MUCS:
-                print("room %s not in bridge.toml mucs: %s"
+                print("room %s not in config.toml mucs: %s"
                       % (ROOM, ", ".join(MUCS)))
                 return
             res = await self.plugin["xep_0045"].join_muc_wait(
