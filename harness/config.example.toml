@@ -51,3 +51,6 @@ max_reply_chars = 8000
 #poll_secs  = 6
 #chunk_chars = 3500                      # reply chunks, under the 4000 body cap
 #allow      = ["owner"]                  # habitat usernames whose DMs trigger turns
+#inbox_lib  = ""                         # libs/inbox/lib.pp source while log/inbox
+                                         # is not yet in a deployed release
+                                         # (default: harness/pp_inbox_lib.pp)
