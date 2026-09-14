@@ -32,33 +32,7 @@ PP_ON = bool(P.get("enabled")) and bool(P.get("base"))
 # start and reloads whenever a poll reports an unbound prim (image
 # restarts and deploys reset loaded libs).
 PP_POLL_EXPR = """
-(let ((me (as-str (whoami))))
-  (let ((parts (list/foldl
-                 (lambda (acc room)
-                   (let* ((rf (chat/row-fields room))
-                          (rid (chat/room-id-of rf))
-                          (peer (chat/dm-peer-from-title (dict-get rf "title") me)))
-                     (let ((rj (list/foldl
-                                 (lambda (a row)
-                                   (let ((f (chat/row-fields row)))
-                                     (string-append a
-                                      (if (string-eq a "") "" ",")
-                                      (dict-set* "{}" (list
-                                        "id" (chat/row-id row)
-                                        "from" (chat/msg-from f)
-                                        "at" (as-str (dict-get f "created_at"))
-                                        "body" (chat/msg-body f))))))
-                                 ""
-                                 rows)))
-                       (string-append acc
-                        (if (string-eq acc "") "" ",")
-                        (dict-set* "{}" (list
-                          "room" rid
-                          "peer" peer
-                          "rows" (string-append "[" rj "]"))))))))
-                 ""
-                 (chat/dms)))
-    (dict-set* "{}" (list "rooms" (string-append "[" parts "]")))))
+(let ((me (as-str (whoami)))) (let ((parts (list/foldl (lambda (acc room) (let* ((rf (chat/row-fields room)) (rid (chat/room-id-of rf)) (peer (chat/dm-peer-from-title (dict-get rf "title") me)) (rows (chat/history rid))) (let ((rj (list/foldl (lambda (a row) (let ((f (chat/row-fields row))) (string-append a (if (string-eq a "") "" ",") (dict-set* "{}" (list "id" (chat/row-id row) "from" (chat/msg-from f) "at" (as-str (dict-get f "created_at")) "body" (chat/msg-body f)))))) "" rows))) (string-append acc (if (string-eq acc "") "" ",") (dict-set* "{}" (list "room" rid "peer" peer "rows" (string-append "[" rj "]"))))))) "" (chat/dms)))) (dict-set* "{}" (list "rooms" (string-append "[" parts "]")))))
 """
 
 
