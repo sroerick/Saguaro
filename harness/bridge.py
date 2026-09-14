@@ -17,44 +17,48 @@ A = cfg["autolith"]; B = cfg["bridge"]
 
 # ---------------------------------------------------------------- pp dm -----
 # Optional Pricklypear DM surface: the bridge polls the habitat's chat
-# DM rooms as the agent identity (HTTP Basic, /api/eval) and runs one
-# consolidated turn per batch against the same autolith session, then
-# answers in-thread via (chat/say-dm). Off unless [pp] enabled=true.
+# DM rooms as the agent identity (Bearer token, /api/eval; PP Basic
+# auth currently 401s) and runs one consolidated turn per batch against
+# the same autolith session, then answers in-thread via (chat/say-dm).
+# Off unless [pp] enabled=true.
 
 P = cfg.get("pp", {}) or {}
 PP_ON = bool(P.get("enabled")) and bool(P.get("base"))
 
-# All DM rooms the agent identity belongs to, newest 30 rows each, as a
-# JSON object string (rows ride as a nested JSON-encoded string because
-# dict-set* quotes values; the bridge json.loads twice). No PP-side
-# deploy needed: composed from prims the chat lib already ships.
+# All DM rooms the agent identity belongs to with their message rows
+# (chat lib: chat/dms + chat/history; created_at rides through as-str so
+# every field is a string). No PP-side deploy needed, but the chat
+# library must be loaded in the eval context: the watcher loads it at
+# start and reloads whenever a poll reports an unbound prim (image
+# restarts and deploys reset loaded libs).
 PP_POLL_EXPR = """
-(let ((rooms (chat/dms)))
+(let ((me (as-str (whoami))))
   (let ((parts (car (list/foldl
                      (lambda (acc room)
                        (let ((rf (chat/row-fields room)))
                          (let ((rid (chat/room-id-of rf)))
-                           (let ((rows (chat/room-rows rid 30)))
-                             (let ((rj (car (list/foldl
-                                              (lambda (a row)
-                                                (let ((f (chat/row-fields row)))
-                                                  (string-append a
-                                                   (if (string-eq a "") "" ",")
-                                                   (dict-set* "{}" (list
-                                                     "id" (chat/row-id row)
-                                                     "from" (chat/msg-from f)
-                                                     "at" (chat/row-at f)
-                                                     "body" (chat/msg-body f))))))
-                                              (list "")
-                                              rows))))
-                               (string-append acc
-                                (if (string-eq acc "") "" ",")
-                                (dict-set* "{}" (list
-                                  "room" rid
-                                  "peer" (chat/peer-of rid)
-                                  "rows" (string-append "[" rj "]")))))))))
+                           (let ((peer (chat/dm-peer-from-title (dict-get rf "title") me)))
+                             (let ((rows (chat/history rid)))
+                               (let ((rj (car (list/foldl
+                                                (lambda (a row)
+                                                  (let ((f (chat/row-fields row)))
+                                                    (string-append a
+                                                     (if (string-eq a "") "" ",")
+                                                     (dict-set* "{}" (list
+                                                       "id" (chat/row-id row)
+                                                       "from" (chat/msg-from f)
+                                                       "at" (as-str (dict-get f "created_at"))
+                                                       "body" (chat/msg-body f))))))
+                                                (list "")
+                                                rows))))
+                                 (string-append acc
+                                  (if (string-eq acc "") "" ",")
+                                  (dict-set* "{}" (list
+                                    "room" rid
+                                    "peer" peer
+                                    "rows" (string-append "[" rj "]"))))))))))
                      (list "")
-                     rooms))))
+                     (chat/dms)))))
     (dict-set* "{}" (list "rooms" (string-append "[" parts "]")))))
 """
 
@@ -80,15 +84,20 @@ def pp_token():
 
 
 def pp_eval(expr, timeout=20):
-    """One /api/eval call; returns the rendered value string."""
+    """One /api/eval call; returns the rendered value (str, or a parsed
+    dict/list when the habitat serializes the result as JSON)."""
+    if (P.get("auth") or "bearer").lower() == "basic":
+        auth = "Basic " + base64.b64encode(
+            ("%s:%s" % (P.get("user", ""), pp_token())).encode()
+        ).decode()
+    else:                      # bearer: no argon2id cost per request
+        auth = "Bearer " + pp_token()
     req = urllib.request.Request(
         P["base"].rstrip("/") + "/api/eval",
         data=json.dumps({"expr": expr}).encode(),
         headers={
             "Content-Type": "application/json",
-            "Authorization": "Basic " + base64.b64encode(
-                ("%s:%s" % (P.get("user", ""), pp_token())).encode()
-            ).decode(),
+            "Authorization": auth,
         },
         method="POST")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -367,14 +376,22 @@ async def pp_dm_watcher(bridge):
     """Poll the habitat for new DM messages; one turn per batch.
     Dedup is by row id (ring) + per-room created_at watermark, so a
     same-second message right behind the cursor still lands. First
-    successful poll only sets cursors: no backlog replay on (re)start."""
+    successful poll only sets cursors: no backlog replay on (re)start.
+    Loads the chat lib once; a deploy or image restart resets loaded
+    libs, so an unbound-prim poll error triggers one reload."""
     allow = set(P.get("allow", []))
     interval = float(P.get("poll_secs", 6))
     cursors, seen, pending = {}, set(), {}
     primed = False
+    lib_loaded = False
     while True:
         try:
-            rooms = json.loads(pp_eval(PP_POLL_EXPR)).get("rooms", [])
+            if not lib_loaded:
+                pp_eval('(load-library "chat")')
+                lib_loaded = True
+            val = pp_eval(PP_POLL_EXPR)
+            data = json.loads(val) if isinstance(val, str) else (val or {})
+            rooms = data.get("rooms") or []
             for room in rooms:
                 rid, peer = room.get("room"), room.get("peer")
                 rows = room.get("rows", "")
@@ -382,7 +399,10 @@ async def pp_dm_watcher(bridge):
                     rows = json.loads(rows)
                 newest = cursors.get(rid, "")
                 for row in rows:
-                    at, frm = row.get("at") or "", row.get("from") or ""
+                    at = row.get("at")
+                    if at is not None and not isinstance(at, str):
+                        at = str(at)      # created_at arrives as int seconds
+                    at, frm = at or "", row.get("from") or ""
                     rid_row = row.get("id") or ""
                     if not at or rid_row in seen:
                         continue
@@ -401,6 +421,8 @@ async def pp_dm_watcher(bridge):
                 bodies = pending.pop(peer)
                 asyncio.ensure_future(pp_handle(bridge, peer, bodies))
         except Exception as e:
+            if "unbound" in str(e):
+                lib_loaded = False
             print("bridge: pp dm poll error: %s" % e, flush=True)
             await asyncio.sleep(min(interval * 5, 60))
             continue
