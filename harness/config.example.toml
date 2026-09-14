@@ -44,8 +44,10 @@ max_reply_chars = 8000
 #[pp]
 #enabled    = false
 #base       = "https://pp.example.net"   # habitat base URL
-#user       = "agent-prickle"            # the agent's habitat identity
-#token_file = "/home/agent/pp.token"     # 0600, one line; or env PP_TOKEN
+#user       = "agent"                    # the agent's habitat identity
+#auth       = "bearer"                   # bearer (default) | basic; PP Basic
+                                         # auth currently 401s on /api/eval
+#token_file = "/home/agent/pp.token"     # 0600, one raw line; or env PP_TOKEN
 #poll_secs  = 6
 #chunk_chars = 3500                      # reply chunks, under the 4000 body cap
 #allow      = ["owner"]                  # habitat usernames whose DMs trigger turns
