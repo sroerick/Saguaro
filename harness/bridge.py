@@ -33,32 +33,31 @@ PP_ON = bool(P.get("enabled")) and bool(P.get("base"))
 # restarts and deploys reset loaded libs).
 PP_POLL_EXPR = """
 (let ((me (as-str (whoami))))
-  (let ((parts (car (list/foldl
-                     (lambda (acc room)
-                       (let ((rf (chat/row-fields room)))
-                         (let ((rid (chat/room-id-of rf)))
-                           (let ((peer (chat/dm-peer-from-title (dict-get rf "title") me)))
-                             (let ((rows (chat/history rid)))
-                               (let ((rj (car (list/foldl
-                                                (lambda (a row)
-                                                  (let ((f (chat/row-fields row)))
-                                                    (string-append a
-                                                     (if (string-eq a "") "" ",")
-                                                     (dict-set* "{}" (list
-                                                       "id" (chat/row-id row)
-                                                       "from" (chat/msg-from f)
-                                                       "at" (as-str (dict-get f "created_at"))
-                                                       "body" (chat/msg-body f))))))
-                                                (list "")
-                                                rows))))
-                                 (string-append acc
-                                  (if (string-eq acc "") "" ",")
-                                  (dict-set* "{}" (list
-                                    "room" rid
-                                    "peer" peer
-                                    "rows" (string-append "[" rj "]"))))))))))
-                     (list "")
-                     (chat/dms)))))
+  (let ((parts (list/foldl
+                 (lambda (acc room)
+                   (let* ((rf (chat/row-fields room))
+                          (rid (chat/room-id-of rf))
+                          (peer (chat/dm-peer-from-title (dict-get rf "title") me)))
+                     (let ((rj (list/foldl
+                                 (lambda (a row)
+                                   (let ((f (chat/row-fields row)))
+                                     (string-append a
+                                      (if (string-eq a "") "" ",")
+                                      (dict-set* "{}" (list
+                                        "id" (chat/row-id row)
+                                        "from" (chat/msg-from f)
+                                        "at" (as-str (dict-get f "created_at"))
+                                        "body" (chat/msg-body f))))))
+                                 ""
+                                 rows)))
+                       (string-append acc
+                        (if (string-eq acc "") "" ",")
+                        (dict-set* "{}" (list
+                          "room" rid
+                          "peer" peer
+                          "rows" (string-append "[" rj "]"))))))))
+                 ""
+                 (chat/dms)))
     (dict-set* "{}" (list "rooms" (string-append "[" parts "]")))))
 """
 
@@ -404,13 +403,17 @@ async def pp_dm_watcher(bridge):
                         at = str(at)      # created_at arrives as int seconds
                     at, frm = at or "", row.get("from") or ""
                     rid_row = row.get("id") or ""
-                    if not at or rid_row in seen:
+                    # chat/say-in writes created_at as "" - row id (a UUID)
+                    # is the real dedup key; the watermark only guards rows
+                    # that do carry a timestamp (wake posts).
+                    if not rid_row or rid_row in seen:
                         continue
                     seen.add(rid_row)
-                    if at > newest:
+                    if at and at > newest:
                         newest = at
+                    cur = cursors.get(rid, "")
                     if primed and frm in allow \
-                            and at >= cursors.get(rid, ""):
+                            and (not at or not cur or at >= cur):
                         pending.setdefault(peer, []).append(row.get("body") or "")
                 cursors[rid] = newest
             if len(seen) > 4000:
