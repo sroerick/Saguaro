@@ -35,6 +35,38 @@ PP_POLL_EXPR = """
 (let ((me (as-str (whoami)))) (let ((parts (list/foldl (lambda (acc room) (let* ((rf (chat/row-fields room)) (rid (chat/room-id-of rf)) (peer (chat/dm-peer-from-title (dict-get rf "title") me)) (rows (chat/history rid))) (let ((rj (list/foldl (lambda (a row) (let ((f (chat/row-fields row))) (string-append a (if (string-eq a "") "" ",") (dict-set* "{}" (list "id" (chat/row-id row) "from" (chat/msg-from f) "at" (as-str (dict-get f "created_at")) "body" (chat/msg-body f)))))) "" rows))) (string-append acc (if (string-eq acc "") "" ",") (dict-set* "{}" (list "room" rid "peer" peer "rows" (string-append "[" rj "]"))))))) "" (chat/dms)))) (dict-set* "{}" (list "rooms" (string-append "[" parts "]")))))
 """
 
+# The inbox lib (log/inbox: durable DM feed + per-user read cursors) is not
+# in a deployed release yet, so load it from the repo file via load-string.
+# Route lines are stripped: a plain load-string session cannot publish the
+# /inbox route (roerick's reseed does that on system/main).
+INBOX_LIB = Path(P.get("inbox_lib",
+                       str(Path(__file__).resolve().parent / "pp_inbox_lib.pp")))
+
+
+def pp_inbox_lib_src():
+    try:
+        lines = INBOX_LIB.read_text().splitlines()
+        return "\n".join(l for l in lines if not l.lstrip().startswith("(route "))
+    except OSError:
+        return ""
+
+
+def pp_load_libs():
+    """chat + ntfy from the deployed release; inbox from the release when
+    a deploy ships it, else from the repo file (pre-reseed bootstrap)."""
+    pp_eval('(load-library "chat")')
+    try:
+        pp_eval('(load-library "ntfy")')
+    except Exception:
+        pass
+    try:
+        pp_eval('(load-library "inbox")')
+        return
+    except Exception:
+        pass
+    src = pp_inbox_lib_src()
+    if src:
+        pp_eval("(load-string %s)" % pp_lisp_str(src))
 
 def run(cmd, timeout=60):
     return subprocess.run(cmd, capture_output=True, text=True,
@@ -88,10 +120,15 @@ def pp_lisp_str(s):
 
 def pp_say_sync(peer, text):
     """Post to a DM thread as the agent identity, chunked under the
-    chat body cap (4000)."""
+    chat body cap (4000), then file one durable inbox row (kind dm).
+    DM delivery stays first: an inbox failure must never block a reply."""
     for part in chunk_text(text, int(P.get("chunk_chars", 3500))):
         pp_eval("(chat/say-dm %s %s)" % (pp_lisp_str(peer), pp_lisp_str(part)))
-
+    try:
+        pp_eval('(inbox/add %s "dm" %s)'
+                % (pp_lisp_str("gregor"), pp_lisp_str(text)))
+    except Exception as e:
+        print("bridge: inbox file failed: %s" % e, flush=True)
 
 # ---------------------------------------------------------------- status ----
 
@@ -343,6 +380,13 @@ async def pp_handle(bridge, peer, bodies):
                              "bridge error: %s: %s" % (type(e).__name__, e))
             except Exception:
                 pass
+        finally:
+            # The turn consumed this batch; advance the agent's read cursor
+            # so the heartbeat's unread line stays honest.
+            try:
+                pp_eval('(inbox/mark-read %s)' % pp_lisp_str("gregor"))
+            except Exception:
+                pass
 
 
 async def pp_dm_watcher(bridge):
@@ -360,7 +404,7 @@ async def pp_dm_watcher(bridge):
     while True:
         try:
             if not lib_loaded:
-                pp_eval('(load-library "chat")')
+                pp_load_libs()
                 lib_loaded = True
             val = pp_eval(PP_POLL_EXPR)
             data = json.loads(val) if isinstance(val, str) else (val or {})
@@ -389,6 +433,15 @@ async def pp_dm_watcher(bridge):
                     if primed and frm in allow \
                             and (not at or not cur or at >= cur):
                         pending.setdefault(peer, []).append(row.get("body") or "")
+                        # Mirror the human's side into the durable inbox
+                        # (kind reply) so /inbox holds the full thread.
+                        try:
+                            pp_eval('(inbox/add %s "reply" %s)'
+                                    % (pp_lisp_str(frm),
+                                       pp_lisp_str(row.get("body") or "")))
+                        except Exception as e:
+                            print("bridge: inbox mirror failed: %s" % e,
+                                  flush=True)
                 cursors[rid] = newest
             if len(seen) > 4000:
                 seen = set(sorted(seen)[-2000:])
