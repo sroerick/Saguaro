@@ -7,7 +7,7 @@ Flow per 1:1 chat message from an allowed JID:
   -> parse the durable conversation log (~/.local/share/autolith/conversations/<id>/*.sexp)
   -> send the agent's new text back over XMPP (chunked)
 """
-import asyncio, json, os, re, subprocess, tomllib
+import asyncio, base64, json, os, re, subprocess, tomllib, urllib.request
 from pathlib import Path
 import slixmpp
 
@@ -15,10 +15,100 @@ CFG_PATH = Path(os.environ.get("BRIDGE_CONFIG", str(Path(__file__).resolve().par
 cfg = tomllib.loads(CFG_PATH.read_text())
 A = cfg["autolith"]; B = cfg["bridge"]
 
+# ---------------------------------------------------------------- pp dm -----
+# Optional Pricklypear DM surface: the bridge polls the habitat's chat
+# DM rooms as the agent identity (HTTP Basic, /api/eval) and runs one
+# consolidated turn per batch against the same autolith session, then
+# answers in-thread via (chat/say-dm). Off unless [pp] enabled=true.
+
+P = cfg.get("pp", {}) or {}
+PP_ON = bool(P.get("enabled")) and bool(P.get("base"))
+
+# All DM rooms the agent identity belongs to, newest 30 rows each, as a
+# JSON object string (rows ride as a nested JSON-encoded string because
+# dict-set* quotes values; the bridge json.loads twice). No PP-side
+# deploy needed: composed from prims the chat lib already ships.
+PP_POLL_EXPR = """
+(let ((rooms (chat/dms)))
+  (let ((parts (car (list/foldl
+                     (lambda (acc room)
+                       (let ((rf (chat/row-fields room)))
+                         (let ((rid (chat/room-id-of rf)))
+                           (let ((rows (chat/room-rows rid 30)))
+                             (let ((rj (car (list/foldl
+                                              (lambda (a row)
+                                                (let ((f (chat/row-fields row)))
+                                                  (string-append a
+                                                   (if (string-eq a "") "" ",")
+                                                   (dict-set* "{}" (list
+                                                     "id" (chat/row-id row)
+                                                     "from" (chat/msg-from f)
+                                                     "at" (chat/row-at f)
+                                                     "body" (chat/msg-body f))))))
+                                              (list "")
+                                              rows))))
+                               (string-append acc
+                                (if (string-eq acc "") "" ",")
+                                (dict-set* "{}" (list
+                                  "room" rid
+                                  "peer" (chat/peer-of rid)
+                                  "rows" (string-append "[" rj "]")))))))))
+                     (list "")
+                     rooms))))
+    (dict-set* "{}" (list "rooms" (string-append "[" parts "]")))))
+"""
+
 
 def run(cmd, timeout=60):
     return subprocess.run(cmd, capture_output=True, text=True,
                           timeout=timeout).stdout
+
+
+
+
+# ------------------------------------------------------- pp eval client -----
+
+def pp_token():
+    """The agent identity's habitat password: token_file (0600) or $PP_TOKEN."""
+    f = P.get("token_file")
+    if f:
+        try:
+            return Path(f).read_text().strip()
+        except OSError:
+            return ""
+    return os.environ.get("PP_TOKEN", "")
+
+
+def pp_eval(expr, timeout=20):
+    """One /api/eval call; returns the rendered value string."""
+    req = urllib.request.Request(
+        P["base"].rstrip("/") + "/api/eval",
+        data=json.dumps({"expr": expr}).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": "Basic " + base64.b64encode(
+                ("%s:%s" % (P.get("user", ""), pp_token())).encode()
+            ).decode(),
+        },
+        method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        body = json.loads(resp.read().decode())
+    if not body.get("ok"):
+        raise RuntimeError("pp eval error: %s" % body.get("error"))
+    return body.get("value") or ""
+
+
+def pp_lisp_str(s):
+    """Escape s for a Nopales string literal. Newlines stay literal:
+    Nopales strings span lines (lib.pp docstrings rely on it)."""
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def pp_say_sync(peer, text):
+    """Post to a DM thread as the agent identity, chunked under the
+    chat body cap (4000)."""
+    for part in chunk_text(text, int(P.get("chunk_chars", 3500))):
+        pp_eval("(chat/say-dm %s %s)" % (pp_lisp_str(peer), pp_lisp_str(part)))
 
 
 # ---------------------------------------------------------------- status ----
@@ -206,6 +296,117 @@ async def recover_agent():
     return None
 
 
+
+
+async def run_turn(body):
+    """One agent turn: tell the session, wait until idle, return the
+    final consolidated text (last assistant message, not narration).
+    The contract consolidated surfaces share; the XMPP paths predate it
+    and keep their own interleaved stream loop."""
+    rec = pick_session()
+    if not rec or not rec.get("conversation"):
+        return "(no autolith session available)"
+    conv = rec["conversation"]
+    watermark = max((r["seq"] for r in all_records(conv)), default=0)
+    run([A["bin"], "localgroup", "tell", rec["session"], body])
+    poll = float(A.get("poll_secs", 1.5))
+    limit = float(A.get("turn_timeout_secs", 900))
+    waited = 0.0
+    while waited < limit:
+        await asyncio.sleep(poll)
+        waited += poll
+        cur = next((r for r in status_records()
+                    if r["session"] == rec["session"]), None)
+        if cur and cur["idle"] and not cur["active"]:
+            break
+    new = [r for r in all_records(conv) if r["seq"] > watermark]
+    texts = [x.strip() for x in reply_texts(new) if x.strip()]
+    if texts:
+        return texts[-1]
+    uo = [r for r in new if r["type"] == "USER-OPERATION"]
+    if uo and len(uo[-1]["strings"]) > 1:
+        return uo[-1]["strings"][-1]
+    return "(no text output)"
+
+
+async def pp_say(bridge, peer, text):
+    await asyncio.to_thread(pp_say_sync, peer, text)
+
+
+async def pp_handle(bridge, peer, bodies):
+    """One consolidated turn per batch of DM messages from one peer."""
+    text = "\n".join(bodies).strip()
+    print("bridge: pp dm from %s (%d chars)" % (peer, len(text)), flush=True)
+    async with bridge.lock:
+        try:
+            if text.lower() == "reset":
+                await pp_say(bridge, peer,
+                             "restarting the agent (kill + resume, ~60s)...")
+                rec = await recover_agent()
+                await pp_say(bridge, peer,
+                             "agent back online (session %s)" % rec["session"]
+                             if rec else
+                             "restart failed to come back - needs eyes on the box")
+            else:
+                # plain word first: localgroup tell treats leading-paren
+                # input as a local Lisp form and hangs the turn in the
+                # Lisp debugger on a parse error.
+                prompt = ("PP DM MESSAGE - do not narrate as you work; "
+                          "send one consolidated reply at the end.\n\n" + text)
+                reply = await run_turn(prompt)
+                await pp_say(bridge, peer, reply or "(no text output)")
+        except Exception as e:
+            try:
+                await pp_say(bridge, peer,
+                             "bridge error: %s: %s" % (type(e).__name__, e))
+            except Exception:
+                pass
+
+
+async def pp_dm_watcher(bridge):
+    """Poll the habitat for new DM messages; one turn per batch.
+    Dedup is by row id (ring) + per-room created_at watermark, so a
+    same-second message right behind the cursor still lands. First
+    successful poll only sets cursors: no backlog replay on (re)start."""
+    allow = set(P.get("allow", []))
+    interval = float(P.get("poll_secs", 6))
+    cursors, seen, pending = {}, set(), {}
+    primed = False
+    while True:
+        try:
+            rooms = json.loads(pp_eval(PP_POLL_EXPR)).get("rooms", [])
+            for room in rooms:
+                rid, peer = room.get("room"), room.get("peer")
+                rows = room.get("rows", "")
+                if isinstance(rows, str):
+                    rows = json.loads(rows)
+                newest = cursors.get(rid, "")
+                for row in rows:
+                    at, frm = row.get("at") or "", row.get("from") or ""
+                    rid_row = row.get("id") or ""
+                    if not at or rid_row in seen:
+                        continue
+                    seen.add(rid_row)
+                    if at > newest:
+                        newest = at
+                    if primed and frm in allow \
+                            and at >= cursors.get(rid, ""):
+                        pending.setdefault(peer, []).append(row.get("body") or "")
+                cursors[rid] = newest
+            if len(seen) > 4000:
+                seen = set(sorted(seen)[-2000:])
+            primed = True
+            while pending and not bridge.lock.locked():
+                peer = next(iter(pending))
+                bodies = pending.pop(peer)
+                asyncio.ensure_future(pp_handle(bridge, peer, bodies))
+        except Exception as e:
+            print("bridge: pp dm poll error: %s" % e, flush=True)
+            await asyncio.sleep(min(interval * 5, 60))
+            continue
+        await asyncio.sleep(interval)
+
+
 class Bridge(slixmpp.ClientXMPP):
     def __init__(self):
         super().__init__(B["jid"], Path(B["password_file"]).read_text().strip())
@@ -228,6 +429,11 @@ class Bridge(slixmpp.ClientXMPP):
         self.send_presence()
         await self.get_roster()
         asyncio.ensure_future(picker_watcher())
+        if PP_ON:
+            asyncio.ensure_future(pp_dm_watcher(self))
+            print("bridge: pp dm watcher on (%s as %s, allow %s)"
+                  % (P.get("base"), P.get("user"), sorted(P.get("allow", []))),
+                  flush=True)
         print("bridge online as", B["jid"], flush=True)
         for room in self.mucs:
             try:

@@ -34,3 +34,18 @@ max_reply_chars = 8000
 #pp_user    = "agent"        # HTTP-basic user for /api/eval
 #pp_token   = ""             # prefer env PP_TOKEN; never commit this file
 #graft_cron = "*/10 * * * *" # drain cadence, see RUNBOOK section 7
+
+# --- optional: Pricklypear DM surface (default off) ---------------------
+# Second habitat integration: the bridge polls the habitat's chat DM
+# rooms as the agent identity and answers in-thread, so the owner can
+# reach the agent from the habitat web UI with no XMPP client. One
+# consolidated turn per batch of messages; "reset" as a DM restarts the
+# agent. Off unless enabled=true.
+#[pp]
+#enabled    = false
+#base       = "https://pp.example.net"   # habitat base URL
+#user       = "agent-prickle"            # the agent's habitat identity
+#token_file = "/home/agent/pp.token"     # 0600, one line; or env PP_TOKEN
+#poll_secs  = 6
+#chunk_chars = 3500                      # reply chunks, under the 4000 body cap
+#allow      = ["owner"]                  # habitat usernames whose DMs trigger turns
