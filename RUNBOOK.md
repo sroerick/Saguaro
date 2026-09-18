@@ -67,7 +67,10 @@ client. It answers from the session you just started.
 
 heartbeat.py nudges the session hourly so a long-running agent keeps its
 rhythm; watchdog.py checks every five minutes and restarts the bridge or
-the session if either died.
+the session if either died. With `[bridge] canary = "on"` the watchdog
+also runs the end-to-end canary (canary.py) on the `canary_secs` cadence:
+wake, connect, deliver one line into `canary_muc` (a test room -- never
+the owner's DM), and alert you when any hop fails.
 
 ## 7. Optional: Pricklypear-backed memory (default: off)
 
@@ -94,3 +97,47 @@ Bump the engine by re-running the installer (it updates in place). Check
 ENGINE_PIN first; soak on a scratch session before flipping production.
 The harness itself: `git pull` in this repo and restart the bridge
 (watchdog will do it for you if you just kill it).
+
+## 9. Secret rotation
+
+Four kinds of secret live around a running saguaro: the XMPP password,
+the habitat token (only if a PP surface is enabled), the model-provider
+API key, and any service tokens the agent holds. None of them belong in
+config.toml or in the repo. If one ever transited a chat, a log, or a
+commit, rotate it now and skip the calendar.
+
+XMPP password (the bridge's identity):
+
+  1. Change it where the account lives (your XMPP server's admin
+     interface, or re-register the account).
+  2. Write the new password to the file `password_file` points at:
+
+         umask 077; printf '%s' 'NEW-PASSWORD' > /path/to/xmpp.password
+
+  3. Restart the bridge (kill the tmux session; the watchdog brings it
+     back within five minutes). The heartbeat, watchdog alerts, and the
+     canary all read the same file, so nothing else needs touching.
+     The next canary run doubles as proof the new password works.
+
+Habitat token (only if [pp] or [memory] is enabled):
+
+  1. Revoke the old token in the habitat, issue a new one.
+  2. Update the environment the bridge and the drains see: PP_TOKEN in
+     the bridge tmux and on the graft-drain cron line (or `token_file`,
+     0600). Never config.toml.
+  3. Restart the bridge; the next drain run picks up the new value.
+
+Model-provider API key:
+
+  Rotate at the provider, update wherever autolith reads it (environment
+  or its own credential store -- see the autolith docs), and restart the
+  agent session.
+
+Rules that keep rotation boring:
+
+  - secret files 0600, owner-only; config.toml never holds a secret
+  - restart the affected process after rotating, then confirm one green
+    signal (the bridge's "online as" log line, a green canary) before
+    trusting it
+  - put long-lived tokens on a rotation calendar even when nothing
+    leaked
