@@ -25,6 +25,39 @@ A = cfg["autolith"]; B = cfg["bridge"]
 P = cfg.get("pp", {}) or {}
 PP_ON = bool(P.get("enabled")) and bool(P.get("base"))
 
+# ------------------------------------------------------------ reply policy --
+# Per-surface reply policy: "stream" delivers assistant text as it flushes
+# (narration included, like a private chat); "consolidate" holds everything
+# and sends one final message, prefixing the turn with a do-not-narrate
+# instruction so the agent works silently. Defaults reproduce the historical
+# behavior per surface; wire any THIRD surface by setting an explicit policy
+# instead of inheriting an accident.
+
+POLICY_DEFAULTS = {"xmpp-private": "stream", "xmpp-group": "consolidate",
+                   "pp-dm": "consolidate"}
+CONSOLIDATE_LABELS = {"xmpp-private": "PRIVATE CHAT MESSAGE",
+                      "xmpp-group": "GROUP CHAT MESSAGE",
+                      "pp-dm": "PP DM MESSAGE"}
+
+
+def reply_policy(surface):
+    """surface: xmpp-private | xmpp-group | pp-dm -> 'stream'|'consolidate'."""
+    if surface == "pp-dm":
+        want = str(P.get("reply_policy", "")).lower()
+    else:
+        key = ("reply_policy_private" if surface == "xmpp-private"
+               else "reply_policy_group")
+        want = str(B.get(key, "")).lower()
+    return want if want in ("stream", "consolidate") else POLICY_DEFAULTS[surface]
+
+
+def consolidate_prefix(surface):
+    # MUST start with a plain word: localgroup tell treats leading-paren
+    # input as a local Lisp form, and an unparseable form hangs the turn
+    # in the Lisp debugger.
+    return ("%s - do not narrate as you work. Send one consolidated reply "
+            "at the end.\n\n" % CONSOLIDATE_LABELS[surface])
+
 # All DM rooms the agent identity belongs to with their message rows
 # (chat lib: chat/dms + chat/history; created_at rides through as-str so
 # every field is a string). No PP-side deploy needed, but the chat
@@ -317,11 +350,13 @@ async def recover_agent():
 
 
 
-async def run_turn(body):
+async def run_turn(body, on_text=None):
     """One agent turn: tell the session, wait until idle, return the
     final consolidated text (last assistant message, not narration).
     The contract consolidated surfaces share; the XMPP paths predate it
-    and keep their own interleaved stream loop."""
+    and keep their own interleaved stream loop. With on_text (streaming
+    policy), every assistant text is delivered through the callback as
+    it flushes and the return value is "" when nothing is left to send."""
     rec = pick_session()
     if not rec or not rec.get("conversation"):
         return "(no autolith session available)"
@@ -331,15 +366,28 @@ async def run_turn(body):
     poll = float(A.get("poll_secs", 1.5))
     limit = float(A.get("turn_timeout_secs", 900))
     waited = 0.0
+    delivered = 0
     while waited < limit:
         await asyncio.sleep(poll)
         waited += poll
+        if on_text:
+            new = [r for r in all_records(conv) if r["seq"] > watermark]
+            texts = [x.strip() for x in reply_texts(new) if x.strip()]
+            while delivered < len(texts):
+                await on_text(texts[delivered])
+                delivered += 1
         cur = next((r for r in status_records()
                     if r["session"] == rec["session"]), None)
         if cur and cur["idle"] and not cur["active"]:
             break
     new = [r for r in all_records(conv) if r["seq"] > watermark]
     texts = [x.strip() for x in reply_texts(new) if x.strip()]
+    if on_text:
+        while delivered < len(texts):
+            await on_text(texts[delivered])
+            delivered += 1
+        if delivered:
+            return ""
     if texts:
         return texts[-1]
     uo = [r for r in new if r["type"] == "USER-OPERATION"]
@@ -369,11 +417,19 @@ async def pp_handle(bridge, peer, bodies):
             else:
                 # plain word first: localgroup tell treats leading-paren
                 # input as a local Lisp form and hangs the turn in the
-                # Lisp debugger on a parse error.
-                prompt = ("PP DM MESSAGE - do not narrate as you work; "
-                          "send one consolidated reply at the end.\n\n" + text)
-                reply = await run_turn(prompt)
-                await pp_say(bridge, peer, reply or "(no text output)")
+                # Lisp debugger on a parse error (the consolidate prefix
+                # provides it; a streaming surface trusts the caller).
+                policy = reply_policy("pp-dm")
+                prompt = text if policy == "stream" \
+                    else consolidate_prefix("pp-dm") + text
+                if policy == "stream":
+                    reply = await run_turn(
+                        prompt, on_text=lambda t: pp_say(bridge, peer, t))
+                    if reply:
+                        await pp_say(bridge, peer, reply)
+                else:
+                    reply = await run_turn(prompt)
+                    await pp_say(bridge, peer, reply or "(no text output)")
         except Exception as e:
             try:
                 await pp_say(bridge, peer,
@@ -563,15 +619,13 @@ class Bridge(slixmpp.ClientXMPP):
                               mtype=mtype)
 
     async def handle(self, jid, body, mtype="chat"):
-        if mtype == "groupchat":
-            # the room never sees narration; tell the agent so it works
-            # silently and produces one consolidated reply. MUST start with a
-            # plain word: localgroup tell treats leading-paren input as a
-            # local Lisp form, and an unparseable form hangs the turn in the
-            # Lisp debugger.
-            body = ("GROUP CHAT MESSAGE - do not narrate as you work. "
-                    "Send one consolidated reply at the end.\n\n" + body)
-        rec = pick_session()
+        surface = "xmpp-group" if mtype == "groupchat" else "xmpp-private"
+        policy = reply_policy(surface)
+        stream = policy == "stream"
+        if not stream:
+            # consolidated surface: narration is held back, so tell the
+            # agent to work silently and produce one consolidated reply.
+            body = consolidate_prefix(surface) + body
         rec = pick_session()
         if not rec or not rec.get("conversation"):
             self.send_message(mto=jid, mbody="no autolith session available",
@@ -587,7 +641,6 @@ class Bridge(slixmpp.ClientXMPP):
         pinged = False
         last_typing = 0.0
         delivered = 0
-        stream = (mtype == "chat")  # MUC: hold everything, one reply at end
 
         def deliver(text):
             if mtype == "chat":
@@ -601,9 +654,9 @@ class Bridge(slixmpp.ClientXMPP):
             if waited - last_typing >= 20:
                 last_typing = waited
                 self.chat_state(jid, "composing")
-            # stream assistant narration/replies as records flush (DM only;
-            # in MUC, narration between tool calls would dump the agent's
-            # inner monologue into the room)
+            # streaming surfaces deliver assistant text (narration included)
+            # as records flush; consolidated surfaces hold everything, so
+            # the agent's inner monologue never lands mid-work
             if stream:
                 new = [r for r in all_records(conv) if r["seq"] > watermark]
                 texts = [x.strip() for x in reply_texts(new) if x.strip()]
@@ -622,7 +675,8 @@ class Bridge(slixmpp.ClientXMPP):
                           "min). If it seems stuck, send: reset"
                           % (int(waited // 60), int(limit // 60)),
                     mtype=mtype)
-        # turn over: DM delivers any tail; MUC delivers the final message only
+        # turn over: streaming surfaces deliver any tail; consolidated
+        # surfaces deliver the final message only
         new = [r for r in all_records(conv) if r["seq"] > watermark]
         texts = [x.strip() for x in reply_texts(new) if x.strip()]
         if stream:
@@ -639,7 +693,7 @@ class Bridge(slixmpp.ClientXMPP):
             elif stream:
                 text = reply_text(new) or "(no text output)"
             else:
-                # MUC: last assistant message = the answer, not the narration
+                # consolidated: last assistant message = the answer, not narration
                 text = texts[-1] if texts else "(no text output)"
             deliver(text)
 

@@ -12,6 +12,23 @@ owner_name = "the owner"                   # used in the HEARTBEAT prompt
 pane = "alagent"                           # tmux pane the picker watcher watches
 start_script = ""                          # boot/watchdog entrypoint; empty = repo start-sessions.sh
 
+# Reply policy per surface: "stream" delivers assistant text as it flushes
+# (narration included, like a private chat); "consolidate" holds everything
+# for one final message and prefixes the turn with a do-not-narrate
+# instruction. Defaults keep the historical behavior per surface -- set an
+# explicit policy on any NEW surface instead of inheriting an accident.
+reply_policy_private = "stream"            # private XMPP chats
+reply_policy_group  = "consolidate"        # MUC rooms
+
+# End-to-end chat-path canary, run by watchdog.py on this cadence: wake
+# (an autolith session answers), connect (fresh XMPP auth plus the bridge's
+# live server connection), deliver (one line posted to canary_muc). The
+# sink must be a room from `mucs` -- never the owner's DM. Silent when
+# green; XMPP alert to the owner when a hop fails.
+canary      = "off"                        # on | off
+canary_secs = 21600                        # seconds between canary runs
+canary_muc  = ""                           # e.g. ops-test@conference.chat.example.net
+
 [autolith]
 bin = "/home/agent/.local/bin/autolith"
 session_id = "auto"                        # or a fixed localgroup session id
@@ -51,6 +68,9 @@ max_reply_chars = 8000
 #poll_secs  = 6
 #chunk_chars = 3500                      # reply chunks, under the 4000 body cap
 #allow      = ["owner"]                  # habitat usernames whose DMs trigger turns
+#reply_policy = "consolidate"            # pp-dm: consolidate | stream (stream
+                                         # sends assistant text as it flushes,
+                                         # narration included)
 #inbox_lib  = ""                         # libs/inbox/lib.pp source while log/inbox
                                          # is not yet in a deployed release
                                          # (default: harness/pp_inbox_lib.pp)
