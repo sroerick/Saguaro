@@ -50,7 +50,11 @@ class Push(slixmpp.ClientXMPP):
         self.to, self.body = to, body
         self.add_event_handler("session_start", self.on_start)
         self.add_event_handler("failed_auth", lambda e: self.loop.stop())
-        self.add_event_handler("connection_failed", lambda e: self.loop.stop())
+        # no connection_failed handler: the server sometimes answers the
+        # FIRST TLS handshake with a protocol-version alert and slixmpp's
+        # connect loop retries successfully ~1s later; bailing out here
+        # used to drop the push on a healthy path. The push() timeout is
+        # the real bound.
 
     async def on_start(self, e):
         self.send_presence()

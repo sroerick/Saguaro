@@ -11,6 +11,10 @@ over a 6s sample AND holds no internet sockets AND the durable conversation
 log hasn't flushed in 10+ min (log flushes only at provider response end) —
 do the kill+resume drill and push an alert. Conversation history survives.
 
+Finally, when [bridge] canary = "on" and the cadence ([bridge] canary_secs)
+has elapsed, run the end-to-end canary (canary.py): wake, connect, deliver
+one message into the canary room. Alerts the owner on failure.
+
 Silent exit when everything is healthy.
 """
 import subprocess
@@ -40,6 +44,22 @@ def agent_status():
 
 def bridge_alive():
     return sh(["/usr/bin/tmux", "has-session", "-t", "xmpp-bridge"]).returncode == 0
+
+
+def canary_due():
+    """True when the canary is enabled and its cadence has elapsed.
+    The state file's mtime is the last green run."""
+    if str(B.get("canary", "off")).lower() != "on":
+        return False
+    try:
+        secs = float(B.get("canary_secs", 21600))
+    except (TypeError, ValueError):
+        secs = 21600.0
+    mark = Path.home() / ".cache" / "saguaro-canary"
+    try:
+        return (time.time() - mark.stat().st_mtime) >= secs
+    except OSError:
+        return True
 
 
 def image_idle_dead(pid):
@@ -110,6 +130,15 @@ def main():
         except Exception as e:
             print("watchdog: push failed: %s" % e, flush=True)
         return
+
+    if canary_due():
+        try:
+            import canary   # lazy: a broken canary must not break the watchdog
+            code = canary.main()
+            if code:
+                print("watchdog: canary exited %s" % code, flush=True)
+        except Exception as e:
+            print("watchdog: canary run failed: %s" % e, flush=True)
 
     # healthy: stay silent
 
