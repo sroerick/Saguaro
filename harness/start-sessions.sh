@@ -11,14 +11,16 @@
 # tmux session names are the documented constants: alagent (the agent TUI)
 # and xmpp-bridge (this gateway). watchdog.py checks for both.
 #
-# 2026-09-19 (agora repair): AUTOLITH_COMPACTION_THRESHOLD=95 for alagent.
-# The standing conversation T6LyTXx sits at ~223K/272K tokens; the automatic
-# compaction (at the default 80% = ~218K) fails with
-# "Compaction produced no summary text." -> agent-loop-error -> image exits
-# 70 -> watchdog restarts -> next turn compacts again -> crash loop (hourly,
-# every heartbeat). Raising the threshold lets normal turns run without a
-# compaction attempt until ~258K. REVERT once the conversation is reset or
-# the upstream compaction bug is fixed.
+# 2026-09-19 compaction-crash history (RESOLVED):
+# The standing conversation hit the 272K-token ceiling; autolith auto-compaction
+# (default 80%) failed with "Compaction produced no summary text." ->
+# agent-loop-error -> image exits 70 -> watchdog restart loop (hourly alerts).
+# Interim "agora repair" raised AUTOLITH_COMPACTION_THRESHOLD=95 to steal time.
+# Proper fix (2026-09-19): autolith upgraded 0.46.1 -> 0.50.0 (compaction
+# hardened in 0.48.0: "Harden conversation compaction, recovery, process
+# handoff...") AND the standing conversation was rotated to a fresh id in
+# config.toml. The threshold override is therefore REMOVED (default 80%.
+# compaction is now healthy and the conversation starts small).
 DIR="${OPENCLIWSP_DIR:-$(cd "$(dirname "$0")" && pwd)}"
 CFG="${BRIDGE_CONFIG:-$DIR/config.toml}"
 export BRIDGE_CONFIG="$CFG"
@@ -31,7 +33,13 @@ AL="${AUTOLITH_BIN:-$HOME/.local/bin/autolith}"
 CONV="$("$PY" -c 'import os,sys,tomllib
 b = tomllib.loads(open(os.environ["BRIDGE_CONFIG"]).read())["autolith"]
 print(b.get("conv", ""))' 2>/dev/null)"
-RESUME=""; [ -n "$CONV" ] && RESUME="resume $CONV"
+# Resume only when the standing conversation actually exists on disk. A
+# fresh/rotated conv id in config.toml therefore starts a brand-new
+# conversation (reset-friendly) instead of failing to resume a phantom.
+RESUME=""
+if [ -n "$CONV" ] && [ -d "$HOME/.local/share/autolith/conversations/$CONV" ]; then
+  RESUME="resume $CONV"
+fi
 
 # Live-process guard (2026-09-19 fix). A tmux session whose command has
 # already exited is a DEAD window, not a running service: tmux retains the
@@ -47,7 +55,7 @@ session_up() {   # $1 = tmux session name   $2 = pgrep pattern for its process
 if ! session_up alagent "autolith"; then
   tmux kill-session -t alagent 2>/dev/null || true
   tmux new-session -d -s alagent \
-    "AUTOLITH_COMPACTION_THRESHOLD=95 $AL $RESUME --permissions full 2>&1"
+    "$AL $RESUME --permissions full 2>&1"
 fi
 
 if ! session_up xmpp-bridge "saguaro-live/harness/bridge.py"; then

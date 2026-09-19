@@ -69,6 +69,17 @@ def bridge_alive():
     return bridge_session_exists() and bridge_pid() is not None
 
 
+def bridge_connected():
+    """The bridge's python process holds a live TCP connection to the chat
+    server (port 5222). Process-alive is not enough: a wedged slixmpp loop
+    can keep the process up while its XMPP/TCP connection is gone."""
+    pid = bridge_pid()
+    if not pid:
+        return False
+    out = sh(["/usr/bin/fstat", "-p", str(pid)]).stdout
+    return ":5222" in out
+
+
 def bridge_pid():
     """The bridge's python process id: pane leader -> child whose comm is
     python (ps truncates the command line, so match on comm, not args)."""
@@ -228,6 +239,11 @@ def main():
                     "bridge python process is dead under a live tmux session")
         else:
             recover_and_alert("xmpp-bridge tmux session gone")
+        return
+
+    # Process alive but NOT holding its chat connection: wedged slixmpp.
+    if bridge_pid() and not bridge_restart_recent() and not bridge_connected():
+        restart_bridge("bridge process is alive but has no live :5222 connection")
         return
 
     # bridge CPU-spin guard: cheap liveness first, then the 10s CPU sample.
