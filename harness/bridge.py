@@ -454,6 +454,8 @@ async def pp_dm_watcher(bridge):
     libs, so an unbound-prim poll error triggers one reload."""
     allow = set(P.get("allow", []))
     interval = float(P.get("poll_secs", 6))
+    poll_timeout = float(P.get("poll_timeout", 60))  # evals can be slow
+    errs = 0
     cursors, seen, pending = {}, set(), {}
     primed = False
     lib_loaded = False
@@ -462,7 +464,7 @@ async def pp_dm_watcher(bridge):
             if not lib_loaded:
                 pp_load_libs()
                 lib_loaded = True
-            val = pp_eval(PP_POLL_EXPR)
+            val = pp_eval(PP_POLL_EXPR, timeout=poll_timeout)
             data = json.loads(val) if isinstance(val, str) else (val or {})
             rooms = data.get("rooms") or []
             for room in rooms:
@@ -507,11 +509,16 @@ async def pp_dm_watcher(bridge):
                 bodies = pending.pop(peer)
                 asyncio.ensure_future(pp_handle(bridge, peer, bodies))
         except Exception as e:
+            errs += 1
             if "unbound" in str(e):
                 lib_loaded = False
             print("bridge: pp dm poll error: %s" % e, flush=True)
-            await asyncio.sleep(min(interval * 5, 60))
+            # Exponential backoff (cap 5 min): don't hammer the habitat
+            # when it is slow or flapping (nginx 502s / read timeouts).
+            await asyncio.sleep(
+                min(interval * (2 ** min(errs, 6)), 300))
             continue
+        errs = 0
         await asyncio.sleep(interval)
 
 
