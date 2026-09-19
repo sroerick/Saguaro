@@ -27,6 +27,19 @@ export BRIDGE_CONFIG="$CFG"
 PY="$DIR/venv/bin/python"; [ -x "$PY" ] || PY=python3
 AL="${AUTOLITH_BIN:-$HOME/.local/bin/autolith}"
 
+# Shell execution under --permissions full goes through cl-exec-sandbox, which
+# needs the process-group helper. The OpenBSD release ships no prebuilt helper,
+# and the upstream helper's setpgid(0, 0) fails with EPERM on this box because
+# every process Autolith spawns is already a session leader (pgid == pid). The
+# local build at ~/.local/libexec (C source beside the binary) skips setpgid
+# when the process is already its own group leader. Fix 2026-09-19: without it
+# every shell.run answered "Full-access execution requires the
+# cl-exec-sandbox process-group helper." (or later, exit 125).
+SB_HELPER="$HOME/.local/libexec/cl-exec-sandbox-process-group"
+if [ -x "$SB_HELPER" ]; then
+  export CL_EXEC_SANDBOX_PROCESS_GROUP_HELPER="$SB_HELPER"
+fi
+
 # First boot on a fresh workspace: generate the persona file if there is none.
 "$PY" "$DIR/scripts/gen_agents.py" 2>/dev/null || true
 
@@ -55,7 +68,7 @@ session_up() {   # $1 = tmux session name   $2 = pgrep pattern for its process
 if ! session_up alagent "autolith"; then
   tmux kill-session -t alagent 2>/dev/null || true
   tmux new-session -d -s alagent \
-    "$AL $RESUME --permissions full 2>&1"
+    "CL_EXEC_SANDBOX_PROCESS_GROUP_HELPER=$SB_HELPER $AL $RESUME --permissions full 2>&1"
 fi
 
 if ! session_up xmpp-bridge "saguaro-live/harness/bridge.py"; then
