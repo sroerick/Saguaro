@@ -38,6 +38,17 @@ CFG="${BRIDGE_CONFIG:-$DIR/config.toml}"
 export BRIDGE_CONFIG="$CFG"
 PY="$DIR/venv/bin/python"; [ -x "$PY" ] || PY=python3
 AL="${AUTOLITH_BIN:-$HOME/.local/bin/autolith}"
+# Shell execution under --permissions full needs the cl-exec-sandbox
+# process-group helper (0.50.0 ships no prebuilt one, and the upstream
+# helper's setpgid(0,0) is EPERM here: every Autolith-spawned process is
+# already a session leader, pgid == pid). Local build in ~/.local/libexec
+# skips setpgid when already its own group leader. Re-asserted 2026-09-20:
+# the 0659f26 export was lost in the 6b34e1e comment rewrite and the live
+# session came up without it (every shell.run failed until set by hand).
+SB_HELPER="$HOME/.local/libexec/cl-exec-sandbox-process-group"
+if [ -x "$SB_HELPER" ]; then
+  export CL_EXEC_SANDBOX_PROCESS_GROUP_HELPER="$SB_HELPER"
+fi
 
 # First boot on a fresh workspace: generate the persona file if there is none.
 "$PY" "$DIR/scripts/gen_agents.py" 2>/dev/null || true
@@ -67,7 +78,7 @@ session_up() {   # $1 = tmux session name   $2 = pgrep pattern for its process
 if ! session_up alagent "autolith"; then
   tmux kill-session -t alagent 2>/dev/null || true
   tmux new-session -d -s alagent \
-    "AUTOLITH_COMPACTION_THRESHOLD=95 $AL $RESUME --permissions full 2>&1"
+    "CL_EXEC_SANDBOX_PROCESS_GROUP_HELPER=$SB_HELPER AUTOLITH_COMPACTION_THRESHOLD=95 $AL $RESUME --permissions full 2>&1"
 fi
 
 if ! session_up xmpp-bridge "saguaro-live/harness/bridge.py"; then
