@@ -21,20 +21,18 @@
 # handoff...") AND the standing conversation was rotated to a fresh id in
 # config.toml. The threshold override is therefore REMOVED (default 80%.
 # compaction is now healthy and the conversation starts small).
-# 2026-09-19 compaction-crash history — STILL OPEN upstream:
-# Conversations balloon quickly (the merge/deploy + heartbeat work injects large
-# repo/git context; observed 0 -> ~221K/272K tokens in ~2h). Autolith auto-compaction
-# fails with "Compaction produced no summary text." (agent/runtime.lisp
-# agent-compact-conversation: the Synthetic/syn:large:text summarizer returns an
-# empty summary -> provider-protocol-error -> image exits 70).
-#
-# 0.46.1 -> 0.50.0 was tried (changelog 0.48.0: "Harden conversation compaction"),
-# but the bug reproduces identically on 0.50.0 with the synthetic provider
-# (confirmed live 2026-09-19). WORKAROUND that actually holds: keep the compaction
-# threshold above the normal operating range (95% = ~258K) so the broken compactor
-# never fires during normal work, and rotate the standing conversation before it
-# reaches ~258K. Without this override (default 80% = ~218K) the compactor fires
-# mid-task and returns empty replies (gregor "goes down"). Real fix = upstream.
+# 2026-09-19 compaction-crash history — DIAGNOSED & FIXED via model:
+# Conversations balloon fast (the merge/deploy + heartbeat work injects large repo/git
+# context; observed 0 -> ~221K/272K in ~2h). Auto-compaction failed with
+# "Compaction produced no summary text." Root cause (probed 2026-09-19): the model
+# behind syn:large:text flipped GLM -> DeepSeek-V4.1-Flash, and DeepSeek intermittently
+# returns an EMPTY assistant message for a huge summarize call -> agent/runtime.lisp
+# agent-compact-conversation errors -> image exits 70. GLM-5.3-Flash returns text
+# reliably on identical 220K contexts (verified), so the agent now runs
+# hf:zai-org/GLM-5.3-Flash (set in ~/.local/state/autolith/preferences.sexp).
+# Keep AUTOLITH_COMPACTION_THRESHOLD=95 (legal max, 272K assumed window -> compacts at
+# ~258K) for headroom so the working conversation gets real room before a (now working)
+# compaction. REVERT to default 80% once autolith also learns the true 524K window.
 DIR="${OPENCLIWSP_DIR:-$(cd "$(dirname "$0")" && pwd)}"
 CFG="${BRIDGE_CONFIG:-$DIR/config.toml}"
 export BRIDGE_CONFIG="$CFG"
