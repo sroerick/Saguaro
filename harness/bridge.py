@@ -7,7 +7,7 @@ Flow per 1:1 chat message from an allowed JID:
   -> parse the durable conversation log (~/.local/share/autolith/conversations/<id>/*.sexp)
   -> send the agent's new text back over XMPP (chunked)
 """
-import asyncio, base64, json, os, re, subprocess, tomllib, urllib.request
+import asyncio, base64, json, os, re, subprocess, time, tomllib, urllib.request
 from pathlib import Path
 import slixmpp
 
@@ -223,11 +223,66 @@ def parse_records(text):
     return records
 
 
+# --- incremental conversation parsing (2026-09-23) -------------------------
+# The standing conversation grows to tens of MB and records flush continuously
+# while a turn runs. The reply loops poll once every `poll_secs` (1.5 s) and
+# re-parsed the WHOLE log each iteration: measured 7.2-8.4 s of CPU per call on
+# a 41 MB conversation, i.e. a saturated core for the whole turn. That is the
+# "slixmpp CPU-spin leak" the watchdog had been chasing — and because the spin
+# guard killed the bridge mid-turn, the owner saw "gregor is typing..." and
+# then no reply (the agent finished the answer into a log nobody was polling).
+# Now each segment is parsed once and only the bytes appended since the last
+# call are parsed again.
+_FILE_CACHE = {}   # str(path) -> {"end": consumed bytes, "recs": [...], "tail": bytes}
+
+
+def _split_last_record(buf):
+    """(complete bytes, trailing partial bytes) of an append-only record log.
+    Records are newline-terminated, so a trailing chunk without its newline is
+    still being written and must be held back."""
+    i = buf.rfind(b"\n(:")
+    if i < 0:
+        return (b"", buf) if buf.startswith(b"(:" ) else (buf, b"")
+    tail = buf[i + 1:]
+    if tail.endswith(b"\n"):
+        return buf, b""
+    return buf[:i + 1], tail
+
+
+def records_for_file(path):
+    key = str(path)
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return []
+    c = _FILE_CACHE.get(key)
+    if c and c["end"] == size:
+        return c["recs"]
+    if c and c["end"] < size:          # append: read only the new bytes
+        with open(path, "rb") as f:
+            f.seek(c["end"])
+            chunk = f.read()
+        buf, base, recs = c["tail"] + chunk, c["end"], list(c["recs"])
+    else:                              # first read (or the file shrank)
+        with open(path, "rb") as f:
+            chunk = f.read()
+        buf, base, recs = chunk, 0, []
+    head, tail = _split_last_record(buf)
+    if head:
+        # decode with universal newlines, exactly like Path.read_text() did,
+        # so tool output containing CRLF parses identically to before
+        text = head.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
+        recs.extend(parse_records(text))
+    _FILE_CACHE[key] = {"end": base + len(chunk) - len(tail),
+                        "recs": recs, "tail": tail}
+    return recs
+
+
 def all_records(conv):
     recs = []
     seen = set()
     for path in conv_files(conv):
-        for r in parse_records(path.read_text(errors="replace")):
+        for r in records_for_file(path):
             if r["seq"] not in seen:
                 seen.add(r["seq"])
                 recs.append(r)
@@ -301,6 +356,29 @@ def allowed(msg):
     allow = set(B.get("allow", []))
     dom = B.get("allow_domain") or ""
     return bare in allow or (dom and bare.endswith("@" + dom))
+
+
+# --- turn-in-flight marker (2026-09-23) ------------------------------------
+# The bridge writes this while it is waiting on an agent turn. watchdog.py
+# must not restart (or kill) the bridge mid-turn: a killed waiter means the
+# owner's answer, once the agent produces it, is never delivered. Cleared at
+# startup so a marker left by a dead bridge can never block repairs.
+TURN_MARK = Path.home() / ".cache" / "saguaro-turn-active"
+
+
+def turn_begin():
+    try:
+        TURN_MARK.parent.mkdir(parents=True, exist_ok=True)
+        TURN_MARK.write_text(str(int(time.time())))
+    except OSError:
+        pass
+
+
+def turn_end():
+    try:
+        TURN_MARK.unlink()
+    except OSError:
+        pass
 
 
 PANE = B.get("pane", "alagent")
@@ -405,6 +483,7 @@ async def pp_handle(bridge, peer, bodies):
     text = "\n".join(bodies).strip()
     print("bridge: pp dm from %s (%d chars)" % (peer, len(text)), flush=True)
     async with bridge.lock:
+        turn_begin()
         try:
             if text.lower() == "reset":
                 await pp_say(bridge, peer,
@@ -437,6 +516,7 @@ async def pp_handle(bridge, peer, bodies):
             except Exception:
                 pass
         finally:
+            turn_end()
             # The turn consumed this batch; advance the agent's read cursor
             # so the heartbeat's unread line stays honest.
             try:
@@ -541,6 +621,7 @@ class Bridge(slixmpp.ClientXMPP):
         self.lock = asyncio.Lock()
 
     async def on_start(self, e):
+        turn_end()          # clear any marker left by a dead bridge
         self.send_presence()
         await self.get_roster()
         asyncio.ensure_future(picker_watcher())
@@ -580,6 +661,8 @@ class Bridge(slixmpp.ClientXMPP):
         prompt = (self.mention_re.sub("", body).strip().lstrip(",;:")
                   .strip() or body)
         asyncio.ensure_future(self.muc_handle(room, prompt))
+        print("bridge: MUC %s from %s: %s" % (room, nick, prompt[:200]),
+              flush=True)
 
     async def muc_handle(self, room, prompt):
         async with self.lock:
@@ -597,8 +680,17 @@ class Bridge(slixmpp.ClientXMPP):
         if msg["type"] not in ("chat", "normal"):
             return
         body = (msg["body"] or "").strip()
-        if not body or not allowed(msg):
+        if not body:
             return
+        if not allowed(msg):
+            # Visibility fix (2026-09-23): a DM from a JID outside the allow
+            # list was dropped in total silence, which looks exactly like the
+            # agent being down. Log it so a JID mismatch is diagnosable.
+            print("bridge: IGNORED DM from %s (not in allow list %s)"
+                  % (msg["from"].bare, B.get("allow", [])), flush=True)
+            return
+        print("bridge: DM from %s: %s" % (msg["from"].bare, body[:200]),
+              flush=True)
         reply_to = msg["from"]
         self.chat_state(reply_to, "composing")
         if body.lower() == "reset":
@@ -640,6 +732,7 @@ class Bridge(slixmpp.ClientXMPP):
             return
         conv = rec["conversation"]
         watermark = max((r["seq"] for r in all_records(conv)), default=0)
+        turn_begin()
         run([A["bin"], "localgroup", "tell", rec["session"], body])
         poll = float(A.get("poll_secs", 1.5))
         limit = float(A.get("turn_timeout_secs", 900))
@@ -703,6 +796,7 @@ class Bridge(slixmpp.ClientXMPP):
                 # consolidated: last assistant message = the answer, not narration
                 text = texts[-1] if texts else "(no text output)"
             deliver(text)
+        turn_end()
 
 
 if __name__ == "__main__":

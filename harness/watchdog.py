@@ -39,8 +39,14 @@ START = B.get("start_script", str(Path(__file__).resolve().parent / "start-sessi
 # box, which starves the agent. Restarting the bridge clears it.
 SPIN_SAMPLE_SECS = 10
 SPIN_CPU_SECS = 8.0          # >= 80% of a core sustained across the sample
-BRIDGE_RESTART_MIN_GAP = 3600  # never restart more than once an hour
+BRIDGE_RESTART_MIN_GAP = 600  # never restart more than once per 10 min
 BRIDGE_RESTART_MARK = Path.home() / ".cache" / "saguaro-bridge-restart"
+# The bridge's turn-in-flight marker (bridge.py turn_begin/turn_end). While the
+# bridge is awaiting an agent turn, restarting it throws the answer away: the
+# agent finishes the reply into a conversation nobody is polling, which is
+# exactly the "he was typing, then nothing" report of 2026-09-23.
+TURN_MARK = Path.home() / ".cache" / "saguaro-turn-active"
+TURN_DEFER_SECS = float(A.get("turn_timeout_secs", 900)) + 600
 
 
 def sh(cmd, timeout=90):
@@ -112,6 +118,21 @@ def cpu_seconds(pid):
         parts.insert(0, 0.0)
     h, m, s = parts
     return days * 86400 + h * 3600 + m * 60 + s
+
+
+def turn_in_flight():
+    """True when the bridge is mid-turn and must not be restarted. A stale
+    marker (older than the turn timeout + slack) means the waiter is gone, so
+    repairs may proceed."""
+    try:
+        age = time.time() - TURN_MARK.stat().st_mtime
+    except OSError:
+        return False
+    if age > TURN_DEFER_SECS:
+        return False
+    print("watchdog: bridge is mid-turn (%.0fs in) - deferring repair"
+          % age, flush=True)
+    return True
 
 
 def bridge_spinning():
@@ -243,12 +264,17 @@ def main():
 
     # Process alive but NOT holding its chat connection: wedged slixmpp.
     if bridge_pid() and not bridge_restart_recent() and not bridge_connected():
+        if turn_in_flight():
+            return
         restart_bridge("bridge process is alive but has no live :5222 connection")
         return
 
     # bridge CPU-spin guard: cheap liveness first, then the 10s CPU sample.
     if bridge_pid() and not bridge_restart_recent() and bridge_spinning():
-        restart_bridge("xmpp-bridge is spinning at ~100% CPU (leak)")
+        if turn_in_flight():
+            return
+        restart_bridge("xmpp-bridge is burning ~100% CPU during a turn "
+                       "(heavy polling, not a leak)")
         return
 
     rec = recs[0]
