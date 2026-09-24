@@ -11,28 +11,35 @@
 # tmux session names are the documented constants: alagent (the agent TUI)
 # and xmpp-bridge (this gateway). watchdog.py checks for both.
 #
-# 2026-09-19 compaction-crash history (RESOLVED):
-# The standing conversation hit the 272K-token ceiling; autolith auto-compaction
-# (default 80%) failed with "Compaction produced no summary text." ->
+# 2026-09-19 compaction-crash history:
+# The standing conversation (T6LyTXx) hit the 272K-token ceiling; autolith
+# auto-compaction failed with "Compaction produced no summary text." ->
 # agent-loop-error -> image exits 70 -> watchdog restart loop (hourly alerts).
 # Interim "agora repair" raised AUTOLITH_COMPACTION_THRESHOLD=95 to steal time.
 # Proper fix (2026-09-19): autolith upgraded 0.46.1 -> 0.50.0 (compaction
-# hardened in 0.48.0: "Harden conversation compaction, recovery, process
-# handoff...") AND the standing conversation was rotated to a fresh id in
-# config.toml. The threshold override is therefore REMOVED (default 80%.
-# compaction is now healthy and the conversation starts small).
-# 2026-09-19 compaction-crash history — DIAGNOSED & FIXED via model:
-# Conversations balloon fast (the merge/deploy + heartbeat work injects large repo/git
-# context; observed 0 -> ~221K/272K in ~2h). Auto-compaction failed with
-# "Compaction produced no summary text." Root cause (probed 2026-09-19): the model
-# behind syn:large:text flipped GLM -> DeepSeek-V4.1-Flash, and DeepSeek intermittently
-# returns an EMPTY assistant message for a huge summarize call -> agent/runtime.lisp
-# agent-compact-conversation errors -> image exits 70. GLM-5.3-Flash returns text
-# reliably on identical 220K contexts (verified), so the agent now runs
-# hf:zai-org/GLM-5.3-Flash (set in ~/.local/state/autolith/preferences.sexp).
-# Keep AUTOLITH_COMPACTION_THRESHOLD=95 (legal max, 272K assumed window -> compacts at
-# ~258K) for headroom so the working conversation gets real room before a (now working)
-# compaction. REVERT to default 80% once autolith also learns the true 524K window.
+# hardened in 0.48.0) AND the standing conversation was rotated to a fresh id
+# in config.toml. The override was briefly removed, then RESTORED at 95
+# (85480f8) when compaction still failed. The agent model was pinned to
+# hf:zai-org/GLM-5.3-Flash (preferences.sexp) after the model behind
+# syn:large:text flipped to DeepSeek-V4.1-Flash, which returns EMPTY assistant
+# messages on huge summarize calls; GLM-5.3-Flash returns text reliably on
+# identical contexts.
+#
+# 2026-09-24 threshold 95 -> 80 (A2WnCgc death):
+# autolith 0.50.0 assumes a 272K window for GLM-5.3-Flash, and the compaction
+# trigger compares provider-REPORTED total_tokens against window*thr/100
+# (agent/should-compact-p, configuration-compaction-token-limit). On this
+# provider the reported total undercounts the provider's own real count ~2.1x:
+# the ledger said 262,059 (input 246,043 + output 16,016) while the next
+# provider call - the compaction upload itself - was rejected at 550,034
+# input tokens vs the TRUE 524,288 window. At 95 the trigger (272K*0.95 =
+# ~258K est) maps to ~550K real, past the ceiling, so compaction died every
+# time and manual compaction died with it. At 80 the trigger is ~218K est
+# (~457K real, ~13% headroom).
+# Do NOT set AUTOLITH_CONTEXT_WINDOW=524288 at this threshold: the trigger is
+# window*thr on REPORTED totals, so 524288*0.80 = 419K est maps to ~880K real
+# for the compaction upload - death either way. If the true window is ever
+# set, drop the threshold to ~40 to keep the trigger at ~210-230K est.
 DIR="${OPENCLIWSP_DIR:-$(cd "$(dirname "$0")" && pwd)}"
 CFG="${BRIDGE_CONFIG:-$DIR/config.toml}"
 export BRIDGE_CONFIG="$CFG"
@@ -78,7 +85,7 @@ session_up() {   # $1 = tmux session name   $2 = pgrep pattern for its process
 if ! session_up alagent "autolith"; then
   tmux kill-session -t alagent 2>/dev/null || true
   tmux new-session -d -s alagent \
-    "CL_EXEC_SANDBOX_PROCESS_GROUP_HELPER=$SB_HELPER AUTOLITH_COMPACTION_THRESHOLD=95 $AL $RESUME --permissions full 2>&1"
+    "CL_EXEC_SANDBOX_PROCESS_GROUP_HELPER=$SB_HELPER AUTOLITH_COMPACTION_THRESHOLD=80 $AL $RESUME --permissions full 2>&1"
 fi
 
 if ! session_up xmpp-bridge "saguaro-live/harness/bridge.py"; then
