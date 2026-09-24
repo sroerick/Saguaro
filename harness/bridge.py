@@ -289,6 +289,27 @@ def all_records(conv):
     return sorted(recs, key=lambda r: r["seq"])
 
 
+# 2026-09-24 watermark fix: a conversation's chunk files do NOT share one
+# monotonic seq space (observed live: chunk 0000000000000001.sexp holds
+# seqs 1..6300 while the active chunk ...0135.sexp emits 135..194), so a
+# single global max(seq) watermark masks every new turn and the bridge
+# answers "(no text output)" on every surface. Track a high-water mark PER
+# FILE instead; a chunk rotated in mid-turn contributes all its records.
+def seq_highwater(conv):
+    """Per-chunk-file max record seq seen so far in conversation CONV."""
+    return {str(p): max((r["seq"] for r in records_for_file(p)), default=0)
+            for p in conv_files(conv)}
+
+
+def new_records(conv, mark):
+    """Records in conversation CONV beyond the per-file watermarks MARK."""
+    out = []
+    for p in conv_files(conv):
+        hi = mark.get(str(p), 0)
+        out.extend(r for r in records_for_file(p) if r["seq"] > hi)
+    return sorted(out, key=lambda r: r["seq"])
+
+
 def reply_texts(new_records):
     """Assistant text messages from PROVIDER-ITEM records, in order.
 
@@ -439,7 +460,7 @@ async def run_turn(body, on_text=None):
     if not rec or not rec.get("conversation"):
         return "(no autolith session available)"
     conv = rec["conversation"]
-    watermark = max((r["seq"] for r in all_records(conv)), default=0)
+    mark = seq_highwater(conv)
     run([A["bin"], "localgroup", "tell", rec["session"], body])
     poll = float(A.get("poll_secs", 1.5))
     limit = float(A.get("turn_timeout_secs", 900))
@@ -449,7 +470,7 @@ async def run_turn(body, on_text=None):
         await asyncio.sleep(poll)
         waited += poll
         if on_text:
-            new = [r for r in all_records(conv) if r["seq"] > watermark]
+            new = new_records(conv, mark)
             texts = [x.strip() for x in reply_texts(new) if x.strip()]
             while delivered < len(texts):
                 await on_text(texts[delivered])
@@ -458,7 +479,7 @@ async def run_turn(body, on_text=None):
                     if r["session"] == rec["session"]), None)
         if cur and cur["idle"] and not cur["active"]:
             break
-    new = [r for r in all_records(conv) if r["seq"] > watermark]
+    new = new_records(conv, mark)
     texts = [x.strip() for x in reply_texts(new) if x.strip()]
     if on_text:
         while delivered < len(texts):
@@ -731,7 +752,7 @@ class Bridge(slixmpp.ClientXMPP):
                               mtype=mtype)
             return
         conv = rec["conversation"]
-        watermark = max((r["seq"] for r in all_records(conv)), default=0)
+        mark = seq_highwater(conv)
         turn_begin()
         run([A["bin"], "localgroup", "tell", rec["session"], body])
         poll = float(A.get("poll_secs", 1.5))
@@ -758,7 +779,7 @@ class Bridge(slixmpp.ClientXMPP):
             # as records flush; consolidated surfaces hold everything, so
             # the agent's inner monologue never lands mid-work
             if stream:
-                new = [r for r in all_records(conv) if r["seq"] > watermark]
+                new = new_records(conv, mark)
                 texts = [x.strip() for x in reply_texts(new) if x.strip()]
                 while delivered < len(texts):
                     deliver(texts[delivered])
@@ -777,7 +798,7 @@ class Bridge(slixmpp.ClientXMPP):
                     mtype=mtype)
         # turn over: streaming surfaces deliver any tail; consolidated
         # surfaces deliver the final message only
-        new = [r for r in all_records(conv) if r["seq"] > watermark]
+        new = new_records(conv, mark)
         texts = [x.strip() for x in reply_texts(new) if x.strip()]
         if stream:
             while delivered < len(texts):
