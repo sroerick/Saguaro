@@ -1174,6 +1174,10 @@ then advance + persist the watermarks. Returns :delivered | :parked."
                              :done)
                            (progn
                              (log-line "reaper: turn in flight (~ds old), waiting" age)
+                             ;; a reap can take minutes; show the owner life
+                             (let ((peer (first (cfg-list "bridge" "allow"))))
+                               (when peer
+                                 (ignore-errors (xmpp-send-state peer :composing))))
                              (turn-wait (getf rec :session))))))
                  (log-line "reaper: orphaned turn ended: ~a" verdict)
                  (let* ((new (collect-turn-records))
@@ -1480,6 +1484,7 @@ inside attribute values do not affect depth."
                 (:composing "composing")
                 (:active "active")
                 (:paused "paused"))))
+    (log-line "typing -> ~a (~a)" to name)
     (xmpp-send (format nil "<message to='~a' type='chat'><~a xmlns='http://jabber.org/protocol/chatstates'/></message>"
                        (xml-escape to) name))))
 
