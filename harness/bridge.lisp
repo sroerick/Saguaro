@@ -794,6 +794,16 @@ parks the text so it is retried later, never dropped."
 (defun record-seq (form)
   (and (listp form) (kid-val form :seq)))
 
+(defun rescan-conversation ()
+  "Drop the incremental parse cache so the next records-for-file re-reads
+   from disk. Called at turn end: the cache is keyed on bytes read, and a
+   turn's final records can land after the last poll, so the answer was
+   occasionally collected as 0 records while the reply sat in the file
+   (observed 2026-09-27 on a pp-dm turn). A full re-parse of the 20MB
+   standing conversation costs ~0.6s — cheap insurance."
+  (dolist (p (conv-files))
+    (remhash (namestring p) *file-cache*)))
+
 (defun advance-watermarks (new-records)
   (dolist (item new-records)
     (bump-watermark (first item) (second item))))
@@ -990,6 +1000,9 @@ for stall-secs. Give up only at the hard cap."
   "Collect everything since the persisted watermarks, deliver per policy,
 then advance + persist the watermarks. Returns :delivered | :parked."
   (declare (ignore session))
+  ;; re-read from disk: the turn's last records may have landed after the
+  ;; final poll (silent 0-record collection was observed on a pp-dm turn)
+  (rescan-conversation)
   (let* ((new (all-new-records))
          (forms (mapcar #'third new))
          (texts (remove-if (lambda (s) (zerop (length (trim s))))
