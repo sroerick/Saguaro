@@ -575,18 +575,29 @@ parks the text so it is retried later, never dropped."
 (defparameter *al-start-timeout* (cfg-int "autolith" "start_timeout_secs" 120))
 
 (defun conversations-dir ()
+  "Directory holding <conv>/*.sexp chunk files.
+
+   Built by string concatenation: merge-pathnames with a HOME that has no
+   trailing slash mangles a relative default into /home/.local/...al
+   (found 2026-09-27 on cutover — conv-files found nothing, so no turn
+   could ever start). A trailing slash on the config value is tolerated."
   (let ((d (cfg-str "autolith" "conversations_dir")))
-    (or (and d d)
-        (merge-pathnames ".local/share/autolith/conversations/" *home*))))
+    (if (and d (plusp (length d)))
+        (if (eql (char d (1- (length d))) #\/)
+            d
+            (concatenate 'string d "/"))
+        (format nil "~a/.local/share/autolith/conversations/" *home*))))
+
+(defun conv-dir-for (conv)
+  (concatenate 'string (conversations-dir) conv "/"))
 
 (defun conv-files ()
   "Sorted .sexp chunk files of the standing conversation, oldest first."
-  (when *al-conv*
-    (let ((dir (merge-pathnames (concatenate 'string *al-conv* "/")
-                                (conversations-dir))))
-      (when (and dir (probe-file dir))
-        (sort (directory (merge-pathnames "*.sexp" dir))
-              #'string< :key #'namestring)))))
+  (when (and *al-conv* (plusp (length *al-conv*)))
+    (let* ((dir (conv-dir-for *al-conv*))
+           (entries (and (probe-file dir) (directory (format nil "~a*.sexp" dir)))))
+      (when entries
+        (sort entries #'string< :key #'namestring)))))
 
 (defun conv-total-size ()
   (loop for p in (conv-files) sum (or (file-size p) 0)))
@@ -608,8 +619,11 @@ parks the text so it is retried later, never dropped."
                             :active (truthy-p (kid-val form :active-turn-p)))))))
 
 (defun kid-val (form key)
-  "Keyword-arg value in a (:type :key val ...) form."
-  (loop for rest on (rest form) by #'cddr
+  "Keyword-arg value in a (:type :key val ...) form. Walks by CDDR but
+   tolerates a trailing odd element (never signals)."
+  (loop for rest on (rest form)
+        while (and (consp rest) (consp (cdr rest)))
+        by #'cddr
         when (eq (first rest) key)
           return (second rest)))
 
