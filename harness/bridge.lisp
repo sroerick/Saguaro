@@ -619,11 +619,10 @@ parks the text so it is retried later, never dropped."
                             :active (truthy-p (kid-val form :active-turn-p)))))))
 
 (defun kid-val (form key)
-  "Keyword-arg value in a (:type :key val ...) form. Walks by CDDR but
-   tolerates a trailing odd element (never signals)."
-  (loop for rest on (rest form)
+  "Keyword-arg value in a (:type :key val ...) form. Walks keyword/value
+   pairs and tolerates a trailing odd element (never signals)."
+  (loop for rest = (rest form) then (cddr rest)
         while (and (consp rest) (consp (cdr rest)))
-        by #'cddr
         when (eq (first rest) key)
           return (second rest)))
 
