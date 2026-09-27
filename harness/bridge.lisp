@@ -1504,12 +1504,12 @@ inside attribute values do not affect depth."
                      (remhash peer *pp-pending*)
                      (when bodies
                        (run-pp-turn peer bodies))
-                     (return)))))
+                     (return))))))
     (error (e)
       (let ((msg (format nil "~a" e)))
         (when (search "unbound" msg)
           (setf *pp-libs-loaded* nil))
-        (log-line "pp dm poll error: ~a" msg))))))
+        (log-line "pp dm poll error: ~a" msg)))))
 
 (defun run-pp-turn (peer bodies)
   (let ((text (format nil "~{~a~^~%~}" bodies)))
