@@ -1144,34 +1144,53 @@ then advance + persist the watermarks. Returns :delivered | :parked."
       (save-state)
       (log-line "baseline: marked ~d existing records as seen (first run)" n))))
 
+(defun session-idle-p (session)
+  (let ((cur (find session (al-status-records)
+                   :key (lambda (r) (getf r :session)) :test #'string=)))
+    (and cur (getf cur :idle) (not (getf cur :active)))))
+
 (defun reap-orphan ()
-  "After (re)start: flush parked texts, and if the turn-in-flight marker
-says a turn was running when the old bridge died, wait for it to finish
-and park its answer for delivery instead of letting the next turn's
-watermark consume it. (The xmpp connection is not up yet during reap,
-so delivery goes through the parked queue.)"
+  "Recover a turn that was in flight when the bridge died.
+
+   If the marker is present and the turn is (or becomes) finished, park its
+   answer for delivery so the next turn's watermark cannot consume it
+   undelivered. The xmpp connection is not up yet here, so delivery goes
+   through the parked queue and the main loop flushes it.
+
+   Fast path: if the agent is ALREADY idle, do not run the full turn-wait —
+   the orphaned turn is over, so collecting is enough. Waiting out
+   start_timeout_secs here cost ~2 min on a restart over a finished turn
+   (observed 2026-09-27)."
   (baseline-watermarks)
   (flush-parked)
-  (let ((age (turn-mark-age)))
-    (when (and age (> age 30) (< age (* 6 3600)))
-      (log-line "reaper: turn was in flight (~ds old), waiting for it" age)
-      (let ((rec (pick-session)))
-        (when (and rec (getf rec :session))
-          (let ((verdict (turn-wait (getf rec :session))))
-            (log-line "reaper: orphaned turn ended: ~a" verdict)
-            (let* ((new (all-new-records))
-                   (texts (remove-if (lambda (s) (zerop (length (trim s))))
-                                     (reply-texts (mapcar #'third new)))))
-              (when texts
-                (let ((peer (first (cfg-list "bridge" "allow"))))
-                  (when peer
-                    (park-pending
-                     peer :xmpp-private
-                     (cap-reply
-                      (format nil "picking up where I left off:~%~%~a"
-                              (first (last texts))))))
-              (advance-watermarks new) (save-state)
-              (turn-end))))))))))
+  (unwind-protect
+       (let ((age (turn-mark-age)))
+         (when (and age (> age 5) (< age (* 6 3600)))
+           (let ((rec (pick-session)))
+             (when (and rec (getf rec :session))
+               (let ((verdict
+                       (if (session-idle-p (getf rec :session))
+                           (progn
+                             (log-line "reaper: orphaned turn already finished")
+                             :done)
+                           (progn
+                             (log-line "reaper: turn in flight (~ds old), waiting" age)
+                             (turn-wait (getf rec :session))))))
+                 (log-line "reaper: orphaned turn ended: ~a" verdict)
+                 (let* ((new (collect-turn-records))
+                        (texts (remove-if (lambda (s) (zerop (length (trim s))))
+                                          (reply-texts (mapcar #'third new)))))
+                   (when texts
+                     (let ((peer (first (cfg-list "bridge" "allow"))))
+                       (when peer
+                         (park-pending
+                          peer :xmpp-private
+                          (cap-reply
+                           (format nil "picking up where I left off:~%~%~a"
+                                   (first (last texts))))))))
+                   (advance-watermarks new) (save-state)))))))
+    ;; always clear the marker: leaving it set makes the next start re-reap
+    (turn-end)))
 
 ;;; ---------------------------------------------------------------------
 ;;; xmpp client — openssl s_client tunnel + streaming stanza reader
