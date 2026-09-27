@@ -76,14 +76,23 @@ def bridge_alive():
 
 
 def bridge_connected():
-    """The bridge's python process holds a live TCP connection to the chat
-    server (port 5222). Process-alive is not enough: a wedged slixmpp loop
-    can keep the process up while its XMPP/TCP connection is gone."""
+    """The bridge holds a live TCP connection to the chat server (port 5222).
+
+    Process-alive is not enough: a wedged slixmpp loop can keep the process
+    up while its XMPP/TCP connection is gone. Two topologies exist now:
+      - bridge.py (slixmpp): the python process owns the socket
+      - bridge.lisp (CL): /usr/bin/openssl s_client is the TLS tunnel and
+        owns the socket, as a CHILD of sbcl (2026-09-27)
+    So check the process and all of its descendants."""
     pid = bridge_pid()
     if not pid:
         return False
-    out = sh(["/usr/bin/fstat", "-p", str(pid)]).stdout
-    return ":5222" in out
+    pids = [str(pid)] + sh(["/usr/bin/pgrep", "-P", str(pid)]).stdout.split()
+    for p in pids:
+        out = sh(["/usr/bin/fstat", "-p", p]).stdout
+        if ":5222" in out:
+            return True
+    return False
 
 
 def bridge_pid():
@@ -95,7 +104,7 @@ def bridge_pid():
         return None
     for child in sh(["/usr/bin/pgrep", "-P", leader[0]]).stdout.split():
         comm = sh(["/bin/ps", "-o", "comm=", "-p", child]).stdout.strip()
-        if comm.startswith("python"):
+        if comm.startswith("python") or comm.startswith("sbcl"):
             return child
     return None
 

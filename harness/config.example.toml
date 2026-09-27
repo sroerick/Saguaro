@@ -74,3 +74,12 @@ max_reply_chars = 8000
 #inbox_lib  = ""                         # libs/inbox/lib.pp source while log/inbox
                                          # is not yet in a deployed release
                                          # (default: harness/pp_inbox_lib.pp)
+
+# --- CL bridge knobs (bridge.lisp, 2026-09-27) ---
+# turn_timeout_secs above is now a HARD CAP, not the primary limit: the CL
+# bridge waits on PROGRESS (turn active, or the conversation log growing)
+# and only gives up after stall_secs of quiet. bridge.py gave up at 900s
+# and let the next turn's watermark consume the answer undelivered.
+#stall_secs = 300            # quiet seconds after idle => turn is over
+#start_timeout_secs = 120    # give up if the tell never registers activity
+#conversations_dir = ""     # default: ~/.local/share/autolith/conversations
