@@ -1082,12 +1082,31 @@ then advance + persist the watermarks. Returns :delivered | :parked."
                (log-line "agent back as session ~a" (getf (first recs) :session))
                (return (first recs))))))
 
+(defun baseline-watermarks ()
+  "On a first run (no persisted state), mark the standing conversation as
+   already seen WITHOUT delivering anything.
+
+   Without this, the first turn collects the entire conversation (6928
+   records observed on cutover) and would deliver the last historical
+   assistant message as though it answered the incoming request. Records
+   are still parsed so every chunk file gets a baseline."
+  (when (null (getf *state* :watermarks))
+    (let ((n 0))
+      (dolist (path (conv-files))
+        (let ((recs (records-for-file path)))
+          (dolist (rec recs)
+            (let ((seq (record-seq rec)))
+              (when seq (bump-watermark path seq) (incf n))))))
+      (save-state)
+      (log-line "baseline: marked ~d existing records as seen (first run)" n))))
+
 (defun reap-orphan ()
   "After (re)start: flush parked texts, and if the turn-in-flight marker
 says a turn was running when the old bridge died, wait for it to finish
 and park its answer for delivery instead of letting the next turn's
 watermark consume it. (The xmpp connection is not up yet during reap,
 so delivery goes through the parked queue.)"
+  (baseline-watermarks)
   (flush-parked)
   (let ((age (turn-mark-age)))
     (when (and age (> age 30) (< age (* 6 3600)))
