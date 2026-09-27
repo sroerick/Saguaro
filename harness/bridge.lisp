@@ -628,8 +628,16 @@ parks the text so it is retried later, never dropped."
           return (second rest)))
 
 (defun read-sexp-records (text)
-  "Read every top-level form we can; skip the ones we can't."
-  (let ((*package* (find-package :keyword))
+  "Read every top-level form we can; skip the ones we can't.
+
+   The scratch package (not KEYWORD) is essential: autolith emits
+   #A((n) BASE-CHAR ...) values, and reading those in KEYWORD makes
+   BASE-CHAR the keyword :BASE-CHAR, which is an invalid array element
+   type. The resulting reader error made this skip a line and then parse
+   the record's remaining elements as separate forms, so
+   al-status-records always returned NIL and no turn could start
+   (found 2026-09-27 on cutover)."
+  (let ((*package* (find-package :bridge-sexp-read))
         (*read-eval* nil)
         (forms '()))
     (with-input-from-string (s text)
