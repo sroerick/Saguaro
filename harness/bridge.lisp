@@ -980,6 +980,7 @@ the Lisp debugger."
 ;;; ---------------------------------------------------------------------
 
 (defparameter *turn* nil)   ; active turn: (:peer .. :surface .. :streamed 0)
+(defparameter *reap-peer* nil)  ; owner to show composing during a reap
 
 (defun turn-wait (session)
   "Wait for one turn to finish. Returns :done | :never-started | :timeout.
@@ -1001,11 +1002,15 @@ collect-turn-records), which retries briefly rather than stalling everyone."
       (incf waited *al-poll-secs*)
       ;; keep the xmpp stream warm while the agent works
       (ignore-errors (xmpp-poll-nonblocking))
-      ;; refresh "is typing" for private chats while the turn runs
-      (when (and *turn* (eq (getf *turn* :surface) :xmpp-private)
-                 (> (- (now) last-typing) *typing-refresh-secs*))
-        (setf last-typing (now))
-        (ignore-errors (xmpp-send-state (getf *turn* :peer) :composing)))
+      ;; refresh "is typing" while work is in progress. Covers both a live
+      ;; turn (*turn*) and a reap, which has no *turn* but can wait minutes.
+      (when (> (- (now) last-typing) *typing-refresh-secs*)
+        (let ((peer (cond ((and *turn* (eq (getf *turn* :surface) :xmpp-private))
+                           (getf *turn* :peer))
+                          ((and (not *turn*) *reap-peer*) *reap-peer*))))
+          (when peer
+            (setf last-typing (now))
+            (ignore-errors (xmpp-send-state peer :composing)))))
       (let ((cur (find session (al-status-records)
                        :key (lambda (r) (getf r :session)) :test #'string=)))
         (when (and cur (or (getf cur :active) (not (getf cur :idle))))
@@ -1174,10 +1179,9 @@ then advance + persist the watermarks. Returns :delivered | :parked."
                              :done)
                            (progn
                              (log-line "reaper: turn in flight (~ds old), waiting" age)
-                             ;; a reap can take minutes; show the owner life
-                             (let ((peer (first (cfg-list "bridge" "allow"))))
-                               (when peer
-                                 (ignore-errors (xmpp-send-state peer :composing))))
+                             ;; a reap can take minutes; keep the owner
+                             ;; informed the whole time (turn-wait refreshes)
+                             (setf *reap-peer* (first (cfg-list "bridge" "allow")))
                              (turn-wait (getf rec :session))))))
                  (log-line "reaper: orphaned turn ended: ~a" verdict)
                  (let* ((new (collect-turn-records))
@@ -1193,6 +1197,7 @@ then advance + persist the watermarks. Returns :delivered | :parked."
                                    (first (last texts))))))))
                    (advance-watermarks new) (save-state)))))))
     ;; always clear the marker: leaving it set makes the next start re-reap
+    (setf *reap-peer* nil)
     (turn-end)))
 
 ;;; ---------------------------------------------------------------------
