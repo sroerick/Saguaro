@@ -602,7 +602,7 @@ parks the text so it is retried later, never dropped."
 (defun conv-total-size ()
   (loop for p in (conv-files) sum (or (file-size p) 0)))
 
-(defun truthy-p (v) (member v '(t :t) :test #'eq))
+(defun truthy-p (v) (and (member v '(t :t) :test #'eq) t))
 
 (defun al-status-records ()
   "((:session \"..\" :conversation \"..\" :pid n :idle b :active b) ...)"
