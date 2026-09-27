@@ -88,8 +88,21 @@ if ! session_up alagent "autolith"; then
     "CL_EXEC_SANDBOX_PROCESS_GROUP_HELPER=$SB_HELPER AUTOLITH_COMPACTION_THRESHOLD=80 $AL $RESUME --permissions full 2>&1"
 fi
 
-if ! session_up xmpp-bridge "saguaro-live/harness/bridge.py"; then
+# Bridge engine (2026-09-27): the Common Lisp bridge is the default; set
+# BRIDGE_ENGINE=python to fall back to bridge.py. Both keep the same tmux
+# session name, log path, config file and turn-in-flight marker, so the
+# watchdog/canary contracts are unchanged.
+BRIDGE_ENGINE="${BRIDGE_ENGINE:-lisp}"
+if [ "$BRIDGE_ENGINE" = "python" ]; then
+  BRIDGE_CMD="$PY $DIR/bridge.py"
+  BRIDGE_PAT="saguaro-live/harness/bridge.py"
+else
+  BRIDGE_CMD="sbcl --script $DIR/bridge.lisp"
+  BRIDGE_PAT="sbcl --script $DIR/bridge.lisp"
+fi
+
+if ! session_up xmpp-bridge "$BRIDGE_PAT"; then
   tmux kill-session -t xmpp-bridge 2>/dev/null || true
   tmux new-session -d -s xmpp-bridge \
-    "$PY $DIR/bridge.py 2>&1 | tee -a $DIR/bridge.log"
+    "$BRIDGE_CMD 2>&1 | tee -a $DIR/bridge.log"
 fi

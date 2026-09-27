@@ -43,7 +43,7 @@ def bridge_pid():
                             timeout=15).split():
         comm = bridge.run(["/bin/ps", "-o", "comm=", "-p", child],
                           timeout=15).strip()
-        if comm.startswith("python"):
+        if comm.startswith("python") or comm.startswith("sbcl"):
             return child
     return None
 
@@ -54,8 +54,13 @@ def bridge_connected():
     is the honest signal."""
     pid = bridge_pid()
     if not pid:
-        return False, "bridge python process not found under tmux xmpp-bridge"
-    out = bridge.run(["/usr/bin/fstat", "-p", pid], timeout=15)
+        return False, "bridge process not found under tmux xmpp-bridge"
+    # the CL bridge's TLS socket belongs to its openssl s_client child
+    pids = [str(pid)] + bridge.run(["/usr/bin/pgrep", "-P", str(pid)],
+                                   timeout=15).split()
+    out = ""
+    for p in pids:
+        out += bridge.run(["/usr/bin/fstat", "-p", p], timeout=15)
     hits = [l for l in out.splitlines()
             if "internet" in l and ":" + XMPP_C2S_PORT in l]
     if not hits:
