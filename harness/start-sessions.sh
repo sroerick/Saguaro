@@ -94,15 +94,17 @@ fi
 # watchdog/canary contracts are unchanged.
 BRIDGE_ENGINE="${BRIDGE_ENGINE:-lisp}"
 if [ "$BRIDGE_ENGINE" = "python" ]; then
-  BRIDGE_CMD="$PY $DIR/bridge.py"
+  # bridge.py prints to stdout only; tee captures it into bridge.log
+  BRIDGE_CMD="$PY $DIR/bridge.py 2>&1 | tee -a $DIR/bridge.log"
   BRIDGE_PAT="saguaro-live/harness/bridge.py"
 else
+  # bridge.lisp writes bridge.log itself (log-line) AND echoes to stdout for
+  # the tmux pane, so DO NOT tee here: that would double every line.
   BRIDGE_CMD="sbcl --script $DIR/bridge.lisp"
   BRIDGE_PAT="sbcl --script $DIR/bridge.lisp"
 fi
 
 if ! session_up xmpp-bridge "$BRIDGE_PAT"; then
   tmux kill-session -t xmpp-bridge 2>/dev/null || true
-  tmux new-session -d -s xmpp-bridge \
-    "$BRIDGE_CMD 2>&1 | tee -a $DIR/bridge.log"
+  tmux new-session -d -s xmpp-bridge "$BRIDGE_CMD"
 fi
