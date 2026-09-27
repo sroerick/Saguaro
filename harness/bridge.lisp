@@ -74,12 +74,20 @@
   (or (getenv* "BRIDGE_CONFIG")
       (merge-pathnames "config.toml" *harness-dir*)))
 
+(defun home-path (relative)
+  "HOME-relative path built by string concatenation.
+
+   merge-pathnames is wrong here: HOME has no trailing slash, so it is
+   treated as a FILE name and '.cache/x' becomes /home/.cache/x/al on a
+   /home/al box. That silently broke the state file and the watchdog's
+   turn-in-flight marker on cutover (2026-09-27)."
+  (format nil "~a/~a" *home* relative))
+
 (defparameter *state-path*
   (or (getenv* "SAGUARO_STATE")
-      (merge-pathnames ".cache/saguaro-bridge-state.sexp" *home*)))
+      (home-path ".cache/saguaro-bridge-state.sexp")))
 
-(defparameter *turn-mark-path*
-  (merge-pathnames ".cache/saguaro-turn-active" *home*))
+(defparameter *turn-mark-path* (home-path ".cache/saguaro-turn-active"))
 
 (defun split-seq (s sep)
   (loop for start = 0 then (1+ end)
@@ -417,13 +425,17 @@ OpenBSD SBCL rejects run-program :output :string, hence pipes (glochid)."
       (setf *state* (list :version 1 :watermarks '() :parked '())))))
 
 (defun save-state ()
-  (ignore-errors
-   (ensure-directories-exist *state-path*)
-   (with-open-file (f *state-path* :direction :output
-                      :if-exists :supersede :if-does-not-exist :create)
-     (let ((*package* (find-package :keyword)))
-       (prin1 *state* f))
-     (terpri f))))
+  "Persist watermarks + parked deliveries. A failure here means replies can
+   be lost on restart, so it is reported, not swallowed."
+  (handler-case
+      (progn
+        (ensure-directories-exist *state-path*)
+        (with-open-file (f *state-path* :direction :output
+                           :if-exists :supersede :if-does-not-exist :create)
+          (let ((*package* (find-package :keyword)))
+            (prin1 *state* f))
+          (terpri f)))
+    (error (e) (log-line "STATE SAVE FAILED (~a): ~a" *state-path* e))))
 
 (defun watermark-for (path)
   (or (cdr (assoc (namestring path) (getf *state* :watermarks)
@@ -445,11 +457,15 @@ OpenBSD SBCL rejects run-program :output :string, hence pipes (glochid)."
 ;;; ---------------------------------------------------------------------
 
 (defun turn-begin ()
-  (ignore-errors
-   (ensure-directories-exist *turn-mark-path*)
-   (with-open-file (f *turn-mark-path* :direction :output
-                      :if-exists :supersede)
-     (prin1 (now) f))))
+  "Marker the watchdog reads to defer repairs mid-turn. Report failure:
+   without it a watchdog restart can eat the answer."
+  (handler-case
+      (progn
+        (ensure-directories-exist *turn-mark-path*)
+        (with-open-file (f *turn-mark-path* :direction :output
+                           :if-exists :supersede)
+          (prin1 (now) f)))
+    (error (e) (log-line "TURN MARKER WRITE FAILED (~a): ~a" *turn-mark-path* e))))
 
 (defun turn-end ()
   (ignore-errors (delete-file *turn-mark-path*)))
@@ -571,7 +587,7 @@ parks the text so it is retried later, never dropped."
 (defparameter *al-conv* (cfg-str "autolith" "conv"))
 (defparameter *al-max-reply-chars* (cfg-int "autolith" "max_reply_chars" 8000))
 (defparameter *al-hard-cap* (cfg-int "autolith" "turn_timeout_secs" 900))
-(defparameter *al-stall-secs* (cfg-int "autolith" "stall_secs" 300))
+(defparameter *al-stall-secs* (cfg-int "autolith" "stall_secs" 45))
 (defparameter *al-start-timeout* (cfg-int "autolith" "start_timeout_secs" 120))
 
 (defun conversations-dir ()
@@ -917,6 +933,9 @@ the Lisp debugger."
                  (return)))))
 
 (defun deliver-once (peer surface text)
+  "Send TEXT to PEER. Returns t when it landed. Logs the attempt: silent
+   delivery was the failure mode this bridge exists to fix."
+  (log-line "deliver ~a (~d chars) to ~a" surface (length text) peer)
   (ecase surface
     (:pp-dm (pp-say-with-retry peer text))
     ((:xmpp-private :xmpp-group)
@@ -977,6 +996,8 @@ then advance + persist the watermarks. Returns :delivered | :parked."
                            (reply-texts forms)))
          (surface (getf *turn* :surface))
          (peer (getf *turn* :peer)))
+    (log-line "turn collected: ~d new records, ~d assistant text(s)"
+              (length new) (length texts))
     (cond (texts
            (let* ((final (if (eq (reply-policy surface) :stream)
                              (format nil "~{~a~^~%~%~}" texts)
