@@ -1161,7 +1161,6 @@ then advance + persist the watermarks. Returns :delivered | :parked."
    the orphaned turn is over, so collecting is enough. Waiting out
    start_timeout_secs here cost ~2 min on a restart over a finished turn
    (observed 2026-09-27)."
-  (baseline-watermarks)
   (flush-parked)
   (unwind-protect
        (let ((age (turn-mark-age)))
@@ -1701,11 +1700,15 @@ inside attribute values do not affect depth."
 (defun main ()
   (load-state)
   (log-line "CL bridge starting (config ~a)" *config-path*)
-  (reap-orphan)
+  ;; NOTE: reap AFTER connecting. reap-orphan may wait on an in-flight turn,
+  ;; and running it first took gregor fully offline (no stanza reading, no
+  ;; ping answers) until that turn ended — observed 2026-09-27.
+  (baseline-watermarks)
   (let ((backoff 5))
     (loop
       ;; connect (or reconnect after any fatal error below)
-      (handler-case (progn (xmpp-connect) (setf backoff 5))
+      (handler-case (progn (xmpp-connect) (setf backoff 5)
+                           (reap-orphan))
         (error (e)
           (log-line "connect failed: ~a — retry in ~ds" e backoff)
           (sleep backoff)
