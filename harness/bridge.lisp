@@ -46,6 +46,11 @@
 ;; an invalid element type). Keywords still read as keywords.
 (defpackage :bridge-sexp-read (:use :cl))
 
+;; `sbcl --script` compiles each top-level form in order, so forward
+;; references between forms emit harmless "undefined variable/function"
+;; warnings. Muffle compile-time noise; runtime errors still surface.
+#+sbcl (declaim (sb-ext:muffle-conditions warning sb-ext:compiler-note))
+
 ;;; ---------------------------------------------------------------------
 ;;; config (minimal TOML subset: [section], "strings", ints, bools, [arrays])
 ;;; ---------------------------------------------------------------------
