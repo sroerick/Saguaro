@@ -14,7 +14,7 @@
 ;;;;      in the conversation log with nobody polling. The next turn took a
 ;;;;      fresh watermark and the orphaned answer was consumed, undelivered,
 ;;;;      forever ("How did it go" x3 in bridge.log). Here: wait on PROGRESS
-;;;;      (turn active or log growing); give up only after stall_secs of
+;;;;      (turn active or log growing); give up only after a short settle
 ;;;;      quiet, under a generous hard cap.
 ;;;;
 ;;;;   2. VOLATILE WATERMARK. Python kept watermarks in memory; any restart
@@ -587,7 +587,7 @@ parks the text so it is retried later, never dropped."
 (defparameter *al-conv* (cfg-str "autolith" "conv"))
 (defparameter *al-max-reply-chars* (cfg-int "autolith" "max_reply_chars" 8000))
 (defparameter *al-hard-cap* (cfg-int "autolith" "turn_timeout_secs" 900))
-(defparameter *al-stall-secs* (cfg-int "autolith" "stall_secs" 45))
+(defparameter *al-settle-secs* (cfg-int "autolith" "settle_secs" 5))
 (defparameter *al-start-timeout* (cfg-int "autolith" "start_timeout_secs" 120))
 
 (defun conversations-dir ()
@@ -794,6 +794,21 @@ parks the text so it is retried later, never dropped."
 (defun record-seq (form)
   (and (listp form) (kid-val form :seq)))
 
+(defun collect-turn-records (&optional (rounds 3))
+  "Records beyond the watermark, re-read from disk each round. If a round
+   yields nothing while the agent is idle, wait one poll and try again (a
+   turn's final records can land just after the last status poll). After
+   ROUNDS attempts, return whatever we have — a genuinely empty turn is
+   legitimate, so this must not loop forever."
+  (loop for attempt from 1 to rounds
+        do (rescan-conversation)
+           (let ((new (all-new-records)))
+             (cond ((plusp (length new)) (return new))
+                   ((= attempt rounds) (return new))
+                   (t (log-line "turn produced nothing yet; retry ~d/~d"
+                                attempt rounds)
+                      (sleep *al-poll-secs*))))))
+
 (defun rescan-conversation ()
   "Drop the incremental parse cache so the next records-for-file re-reads
    from disk. Called at turn end: the cache is keyed on bytes read, and a
@@ -949,6 +964,9 @@ the Lisp debugger."
   (ecase surface
     (:pp-dm (pp-say-with-retry peer text))
     ((:xmpp-private :xmpp-group)
+     ;; clear the typing indicator just before the body lands
+     (when (eq surface :xmpp-private)
+       (ignore-errors (xmpp-send-state peer :active)))
      (xmpp-send-message peer surface text)
      t)))
 
@@ -964,17 +982,30 @@ the Lisp debugger."
 (defparameter *turn* nil)   ; active turn: (:peer .. :surface .. :streamed 0)
 
 (defun turn-wait (session)
-  "Returns :done | :never-started | :timeout.
+  "Wait for one turn to finish. Returns :done | :never-started | :timeout.
+
 Activity = autolith reports the turn active, or the conversation log grew
-(the log flushes at each provider response end). Finished = idle AND quiet
-for stall-secs. Give up only at the hard cap."
+(the log flushes at every provider response end).
+
+Finished = we saw activity, autolith is now idle, and it has stayed idle for
+settle-secs. settle-secs is SHORT (default 5s): the agent is idle the instant
+the answer is written, so a long quiet window is pure added latency on every
+turn (60s of dead air per turn was observed 2026-09-27). The old 60s window
+only guarded against a mid-turn idle blip; that is handled instead by
+checking, after the settle, whether the turn actually produced content (see
+collect-turn-records), which retries briefly rather than stalling everyone."
   (let ((waited 0) (started nil) (last-size (conv-total-size))
-        (last-activity (now)))
+        (last-activity (now)) (last-typing 0))
     (loop
       (sleep *al-poll-secs*)
       (incf waited *al-poll-secs*)
       ;; keep the xmpp stream warm while the agent works
       (ignore-errors (xmpp-poll-nonblocking))
+      ;; refresh "is typing" for private chats while the turn runs
+      (when (and *turn* (eq (getf *turn* :surface) :xmpp-private)
+                 (> (- (now) last-typing) *typing-refresh-secs*))
+        (setf last-typing (now))
+        (ignore-errors (xmpp-send-state (getf *turn* :peer) :composing)))
       (let ((cur (find session (al-status-records)
                        :key (lambda (r) (getf r :session)) :test #'string=)))
         (when (and cur (or (getf cur :active) (not (getf cur :idle))))
@@ -983,7 +1014,7 @@ for stall-secs. Give up only at the hard cap."
           (when (> size last-size)
             (setf last-size size started t last-activity (now))))
         (when (and started cur (getf cur :idle) (not (getf cur :active))
-                   (>= (- (now) last-activity) *al-stall-secs*))
+                   (>= (- (now) last-activity) *al-settle-secs*))
           (return :done))
         (when (and (not started) (> waited *al-start-timeout*))
           (return :never-started))
@@ -1000,10 +1031,10 @@ for stall-secs. Give up only at the hard cap."
   "Collect everything since the persisted watermarks, deliver per policy,
 then advance + persist the watermarks. Returns :delivered | :parked."
   (declare (ignore session))
-  ;; re-read from disk: the turn's last records may have landed after the
-  ;; final poll (silent 0-record collection was observed on a pp-dm turn)
-  (rescan-conversation)
-  (let* ((new (all-new-records))
+  ;; re-read from disk and retry briefly if empty: the turn's last records
+  ;; can land after the final poll (silent 0-record collection was observed
+  ;; on a pp-dm turn), and a mid-turn idle blip could exit the wait early
+  (let* ((new (collect-turn-records))
          (forms (mapcar #'third new))
          (texts (remove-if (lambda (s) (zerop (length (trim s))))
                            (reply-texts forms)))
@@ -1421,6 +1452,22 @@ inside attribute values do not affect depth."
                        (when close (subseq stanza (1+ gt) close))))))))
     (when text (xml-unescape (xml-inner-text (format nil "<x>~a</x>" text))))))
 
+(defun xmpp-send-state (to state)
+  "XEP-0085 chat state to a 1:1 peer (:composing | :active | :paused).
+   Only private chat: a room has no per-peer indicator. This replaces the
+   old bridge's 5-minute 'still working' CHAT MESSAGE, which was noise —
+   the indicator disappears on its own when the bridge dies, so a stuck
+   turn looks stuck instead of generating spam."
+  (let ((name (ecase state
+                (:composing "composing")
+                (:active "active")
+                (:paused "paused"))))
+    (xmpp-send (format nil "<message to='~a' type='chat'><~a xmlns='http://jabber.org/protocol/chatstates'/></message>"
+                       (xml-escape to) name))))
+
+;; Client-side indicators expire, so refresh while work is in progress.
+(defparameter *typing-refresh-secs* 15)
+
 (defun xmpp-send-message (to surface text)
   (let ((mtype (if (eq surface :xmpp-group) "groupchat" "chat"))
         (maxchars (cfg-int "autolith" "max_reply_chars" 8000)))
@@ -1506,6 +1553,8 @@ inside attribute values do not affect depth."
 
 (defun handle-dm (bare body)
   (log-line "DM from ~a: ~a" bare (subseq body 0 (min 200 (length body))))
+  ;; immediate feedback: "is typing..." the moment the DM lands
+  (ignore-errors (xmpp-send-state bare :composing))
   (enqueue bare :xmpp-private body))
 
 (defun enqueue (peer surface body)
