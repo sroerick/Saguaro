@@ -967,8 +967,8 @@ the Lisp debugger."
      ;; clear the typing indicator just before the body lands
      (when (eq surface :xmpp-private)
        (ignore-errors (xmpp-send-state peer :active)))
-     (xmpp-send-message peer surface text)
-     t)))
+     (handler-case (progn (xmpp-send-message peer surface text) t)
+       (error (e) (log-line "send to ~a failed: ~a" peer e) nil)))))
 
 ;;; ---------------------------------------------------------------------
 ;;; the turn engine
@@ -1002,6 +1002,8 @@ collect-turn-records), which retries briefly rather than stalling everyone."
       (incf waited *al-poll-secs*)
       ;; keep the xmpp stream warm while the agent works
       (ignore-errors (xmpp-poll-nonblocking))
+      ;; deliver narration as it flushes while the turn runs
+      (when *turn* (ignore-errors (stream-poll nil)))
       ;; refresh "is typing" while work is in progress. Covers both a live
       ;; turn (*turn*) and a reap, which has no *turn* but can wait minutes.
       (when (> (- (now) last-typing) *typing-refresh-secs*)
@@ -1034,7 +1036,11 @@ collect-turn-records), which retries briefly rather than stalling everyone."
 
 (defun turn-collect-and-deliver (rec session)
   "Collect everything since the persisted watermarks, deliver per policy,
-then advance + persist the watermarks. Returns :delivered | :parked."
+then advance + persist the watermarks. Returns :delivered | :parked.
+
+On a :stream surface the narration already went out live (stream-poll runs
+inside turn-wait), so only texts past :streamed are sent here. Re-sending
+the whole set used to duplicate the reply as one large trailing message."
   (declare (ignore session))
   ;; re-read from disk and retry briefly if empty: the turn's last records
   ;; can land after the final poll (silent 0-record collection was observed
@@ -1044,33 +1050,47 @@ then advance + persist the watermarks. Returns :delivered | :parked."
          (texts (remove-if (lambda (s) (zerop (length (trim s))))
                            (reply-texts forms)))
          (surface (getf *turn* :surface))
-         (peer (getf *turn* :peer)))
-    (log-line "turn collected: ~d new records, ~d assistant text(s)"
-              (length new) (length texts))
-    (cond (texts
-           (let* ((final (if (eq (reply-policy surface) :stream)
-                             (format nil "~{~a~^~%~%~}" texts)
-                             (or (first (last texts))
-                                 (last-user-operation-echo forms)
-                                 "(no text output)")))
-                  (out (cap-reply final)))
-             (if (deliver-once peer surface out)
-                 (prog1 :delivered
-                   (advance-watermarks new) (save-state))
-                 (progn (park-pending peer surface out)
-                        (advance-watermarks new) (save-state)
-                        :parked))))
-          (t
-           ;; nothing textual: still advance so tool noise never leaks into
-           ;; the next turn's delta, and tell the human the turn is over
-           (advance-watermarks new) (save-state)
-           (if (deliver-once peer surface "(no text output)")
-               :delivered
-               (progn (park-pending peer surface "(no text output)")
-                      :parked))))))
+         (peer (getf *turn* :peer))
+         (streaming (eq (reply-policy surface) :stream))
+         (streamed (if streaming (or (getf *turn* :streamed) 0) 0))
+         (remaining (if streaming
+                        (subseq texts (min streamed (length texts)))
+                        nil)))
+    (log-line "turn collected: ~d new records, ~d assistant text(s) (~d streamed)"
+              (length new) (length texts) streamed)
+    (cond
+      ((and streaming texts (null remaining))
+       ;; every text already delivered live: nothing left to send
+       (advance-watermarks new) (save-state)
+       :delivered)
+      (texts
+       (let* ((final (if streaming
+                         (format nil "~{~a~^~%~%~}" remaining)
+                         (or (first (last texts))
+                             (last-user-operation-echo forms)
+                             "(no text output)")))
+              (out (cap-reply final)))
+         (if (deliver-once peer surface out)
+             (prog1 :delivered
+               (advance-watermarks new) (save-state))
+             (progn (park-pending peer surface out)
+                    (advance-watermarks new) (save-state)
+                    :parked))))
+      (t
+       ;; nothing textual: still advance so tool noise never leaks into
+       ;; the next turn's delta, and tell the human the turn is over
+       (advance-watermarks new) (save-state)
+       (if (deliver-once peer surface "(no text output)")
+           :delivered
+           (progn (park-pending peer surface "(no text output)")
+                  :parked))))))
 
 (defun stream-poll (rec)
-  "Streaming surfaces deliver each assistant text as it flushes."
+  "Streaming surfaces deliver each assistant text as it flushes. Called
+from turn-wait so narration lands live, and once more at turn end. Only a
+successful send advances :streamed, so a failed fragment is retried on the
+next poll instead of being logged as sent and lost."
+  (declare (ignore rec))
   (when (eq (reply-policy (getf *turn* :surface)) :stream)
     (let* ((new (all-new-records))
            (forms (mapcar #'third new))
@@ -1078,11 +1098,12 @@ then advance + persist the watermarks. Returns :delivered | :parked."
                              (reply-texts forms)))
            (delivered (getf *turn* :streamed 0)))
       (when (> (length texts) delivered)
-        (dolist (text (subseq texts delivered))
-          (ignore-errors
-           (deliver-once (getf *turn* :peer) (getf *turn* :surface) text)))
-        (setf (getf *turn* :streamed) (length texts)
-              (getf *turn* :streamed-watermarks) new)))))
+        (let ((n delivered))
+          (dolist (text (subseq texts delivered))
+            (when (deliver-once (getf *turn* :peer) (getf *turn* :surface) text)
+              (incf n)))
+          (setf (getf *turn* :streamed) n
+                (getf *turn* :streamed-watermarks) new))))))
 
 (defun run-turn (peer surface prompt)
   "One full turn. Returns :delivered | :parked | :failed | :no-session."
