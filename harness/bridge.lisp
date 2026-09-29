@@ -1113,7 +1113,8 @@ next poll instead of being logged as sent and lost."
       (return-from run-turn :no-session))
     (let ((session (getf rec :session)))
       (turn-begin)
-      (setf *turn* (list :peer peer :surface surface :streamed 0))
+      (setf *turn* (list :peer peer :surface surface :streamed 0
+                                :started (now)))
       (log-line "turn start: session ~a surface ~a peer ~a"
                 session surface peer)
       (al-tell session prompt)
@@ -1127,6 +1128,7 @@ next poll instead of being logged as sent and lost."
                   session)
         (stream-poll rec)
         (let ((result (turn-collect-and-deliver rec session)))
+          (ignore-errors (sync-tasks))
           (setf *turn* nil)
           (turn-end)
           (when (eq verdict :never-started)
@@ -1727,6 +1729,7 @@ inside attribute values do not affect depth."
 (defparameter *main-last-keepalive* 0)
 (defparameter *main-last-pp-poll* 0)
 (defparameter *main-last-flush* 0)
+(defparameter *main-last-task-poll* 0)
 
 (defun main ()
   (load-state)
@@ -1786,6 +1789,11 @@ inside attribute values do not affect depth."
                   (pp-poll)))
               ;; 6. picker watcher
               (picker-watch)
+
+              ;; 6b. detached child jobs: announce completions
+              (when (> (- (now) *main-last-task-poll*) *task-poll-secs*)
+                (setf *main-last-task-poll* (now))
+                (ignore-errors (sync-tasks)))
               ;; 7. retry parked deliveries
               (when (getf *state* :parked)
                 (when (> (- (now) *main-last-flush*) 30)
@@ -1805,6 +1813,181 @@ XEP-0199 pings keep the stream warm, and TCP keepalive covers dead peers."
   (if (listen (getf *conn* :in))
       (xmpp-next-stanza)
       (progn (sleep 0.5) nil)))
+
+;;; ---------------------------------------------------------------------
+;;; detached child-agent completions
+;;;
+;;; The agent can hand long work to a child (task.run). A DETACHED child
+;;; finishes out of band: the standing conversation does not change until
+;;; the parent's next turn boundary, so the result would sit until the
+;;; owner happened to write again. Watch the task store and push it.
+;;;
+;;; Store: <data>/tasks/<conversation>/<child>/result.sexp, one plist:
+;;; :agent-definition :id :name :agent :agent-source :assignment :status
+;;; :output :error :yielded-p :request-count :usage :duration-ms :model
+;;; :detached. Text fields may arrive as #A((n) BASE-CHAR ...) vectors, so
+;;; everything goes through text-of. :status and :duration-ms sit after
+;;; :output, so a half-written file fails the completeness check instead of
+;;; announcing a truncated result.
+;;; ---------------------------------------------------------------------
+
+(defparameter *task-poll-secs*
+  (max (cfg-int "bridge" "task_poll_secs" 10) 1))
+
+(defparameter *task-notify-chars*
+  (max (cfg-int "bridge" "task_notify_chars" 1200) 100))
+
+(defun plist-val (form key)
+  "Plain plist lookup. kid-val assumes a leading type keyword; result.sexp
+   has none, its first key carries a value, so kid-val is off by one here."
+  (loop for rest = form then (cddr rest)
+        while (and (consp rest) (consp (cdr rest)))
+        when (eq (first rest) key) return (second rest)))
+
+(defun text-of (v)
+  "Coerce a result field to a string; Autolith emits some as
+   #A((n) BASE-CHAR ...) vectors."
+  (cond ((null v) nil)
+        ((stringp v) v)
+        ((and (vectorp v) (plusp (length v)) (typep (aref v 0) 'base-char))
+         (coerce v 'string))
+        (t (format nil "~a" v))))
+
+(defun tasks-dir ()
+  "Tasks live beside the conversations: <data>/tasks/."
+  (let ((c (conversations-dir)))
+    (concatenate 'string
+                 (subseq c 0 (1+ (position #\/ c :from-end t
+                                           :end (1- (length c)))))
+                 "tasks/")))
+
+(defun task-conversation ()
+  (or (and *al-conv* (plusp (length *al-conv*)) *al-conv*)
+      (getf (first (al-status-records)) :conversation)))
+
+(defun task-namespace ()
+  (let ((conv (task-conversation)))
+    (when conv (concatenate 'string (tasks-dir) conv "/"))))
+
+(defun child-dirs (dir)
+  "Child ids present in DIR (one namespace of the task store)."
+  (when (and dir (probe-file dir))
+    (loop for p in (directory (concatenate 'string dir "*"))
+          for name = (car (last (pathname-directory p)))
+          when (and name (string/= name "conversation-picker"))
+            collect name)))
+
+(defun child-result (child)
+  "Parsed result.sexp for CHILD, or nil while absent or half-written."
+  (let ((raw (read-file-string
+              (concatenate 'string (task-namespace) child "/result.sexp"))))
+    (when (and raw (plusp (length raw)))
+      (let ((form (first (read-sexp-records raw))))
+        (when (and (listp form)
+                   (plist-val form :status)
+                   (member :duration-ms form))
+          form)))))
+
+(defun task-key (child)
+  (concatenate 'string (or (task-conversation) "") "/" child))
+
+(defun known-tasks () (getf *state* :tasks))
+
+(defun known-task (key) (assoc key (known-tasks) :test #'string=))
+
+(defun remember-task (key peer surface delivered)
+  (let ((cur (known-task key)))
+    (if cur
+        (setf (getf (cdr cur) :delivered) delivered)
+        (setf (getf *state* :tasks)
+              (acons key (list :peer peer :surface surface :delivered delivered
+                               :seen (now))
+                     (known-tasks))))))
+
+(defun fallback-peer ()
+  (or (first (cfg-list "bridge" "allow")) "the owner"))
+
+(defun deliver-notice (peer surface text)
+  "Send an out-of-band notice. No composing->active chat-state dance: that
+   belongs to a turn."
+  (log-line "notice ~a (~d chars) to ~a" surface (length text) peer)
+  (ecase surface
+    (:pp-dm (pp-say-with-retry peer text))
+    ((:xmpp-private :xmpp-group)
+     (handler-case (progn (xmpp-send-message peer surface text) t)
+       (error (e) (log-line "notice to ~a failed: ~a" peer e) nil)))))
+
+(defun task-headline (form)
+  (let ((name (text-of (plist-val form :name)))
+        (status (plist-val form :status))
+        (ms (plist-val form :duration-ms)))
+    (format nil "~a~@[ (~a)~]~@[ [~a]~]"
+            (or name "child job")
+            (when (numberp ms) (format nil "~,1fs" (/ ms 1000.0)))
+            (and status (string-downcase (symbol-name status))))))
+
+(defun task-body (form)
+  (let* ((err (text-of (plist-val form :error)))
+         (out (text-of (plist-val form :output)))
+         (text (if (and err (plusp (length err)))
+                   (format nil "error: ~a" err)
+                   (string-trim '(#\Space #\Newline #\Return) (or out ""))))
+         (n *task-notify-chars*))
+    (if (> (length text) n)
+        (concatenate 'string (subseq text 0 n) "...[truncated]")
+        text)))
+
+(defun announce-task (child)
+  (let* ((key (task-key child))
+         (task (known-task key))
+         (form (and task (not (getf (cdr task) :delivered))
+                    (child-result child))))
+    (when form
+      (let ((peer (or (getf (cdr task) :peer) (fallback-peer)))
+            (surface (or (getf (cdr task) :surface) :xmpp-private))
+            (text (format nil "background job finished: ~a~%~a"
+                          (task-headline form) (task-body form))))
+        (log-line "child job ~a finished -> ~a" child peer)
+        (if (deliver-notice peer surface text)
+            (log-line "announced child job ~a to ~a" child peer)
+            (park-pending peer surface text))
+        (setf (getf (cdr task) :delivered) t)
+        (save-state)))))
+
+(defun sync-tasks ()
+  "Adopt new children, then announce any that finished. A child seen while a
+   turn runs inherits that turn's peer; the rest fall back to the owner."
+  (let ((dir (task-namespace)))
+    (when dir
+      (unless (getf *state* :tasks-baselined)
+        (dolist (child (child-dirs dir))
+          (remember-task (task-key child) nil nil t))
+        (setf (getf *state* :tasks-baselined) t)
+        (save-state)
+        (log-line "task store baselined (~d child jobs on disk)"
+                  (length (known-tasks)))
+        (return-from sync-tasks))
+      ;; a child adopted mid-turn by the periodic poll may have landed on the
+      ;; fallback peer; while the turn is still open, claim it for its peer
+      (when *turn*
+        (let ((started (or (getf *turn* :started) 0)))
+          (dolist (child (child-dirs dir))
+            (let ((task (known-task (task-key child))))
+              (when (and task
+                         (not (getf (cdr task) :delivered))
+                         (>= (or (getf (cdr task) :seen) 0) started))
+                (setf (getf (cdr task) :peer) (getf *turn* :peer)
+                      (getf (cdr task) :surface) (getf *turn* :surface)))))))
+      (dolist (child (child-dirs dir))
+        (unless (known-task (task-key child))
+          (remember-task (task-key child)
+                         (or (and *turn* (getf *turn* :peer)) (fallback-peer))
+                         (or (and *turn* (getf *turn* :surface)) :xmpp-private)
+                         nil)
+          (save-state)
+          (log-line "tracking child job ~a" child)))
+      (dolist (child (child-dirs dir))
+        (announce-task child)))))
 
 (unless (getenv* "SAGUARO_NO_MAIN")
   (main))
