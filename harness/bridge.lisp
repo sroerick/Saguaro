@@ -1034,18 +1034,43 @@ collect-turn-records), which retries briefly rather than stalling everyone."
                    (format nil "~%...[truncated]"))
       text))
 
+(defun turn-floor ()
+  "Highest record seq already on disk when this turn's prompt went out.
+
+   Heartbeat turns share the standing conversation, so their replies (a bare
+   \"OK\") are 'new records' to a watermark but are not ours to deliver. They
+   used to be swept into the joined reply; once streaming went live they
+   arrived as stray two-character messages at the head of the turn. Records
+   at or below this seq belong to whoever ran before us."
+  (and *turn* (getf *turn* :floor)))
+
+(defun above-floor (new)
+  (let ((floor (turn-floor)))
+    (if floor
+        (remove-if (lambda (item) (<= (second item) floor)) new)
+        new)))
+
+(defun current-max-seq ()
+  "Seq of the newest record already on disk (0 when the log is empty)."
+  (let ((m 0))
+    (dolist (item (all-new-records))
+      (when (> (second item) m) (setf m (second item))))
+    m))
+
 (defun turn-collect-and-deliver (rec session)
   "Collect everything since the persisted watermarks, deliver per policy,
 then advance + persist the watermarks. Returns :delivered | :parked.
 
-On a :stream surface the narration already went out live (stream-poll runs
-inside turn-wait), so only texts past :streamed are sent here. Re-sending
-the whole set used to duplicate the reply as one large trailing message."
+Watermarks advance past every new record (including other actors' turns in
+this conversation) so nothing is re-read, but only records above the turn
+floor are delivered. On a :stream surface the narration already went out
+live, so only texts past :streamed are sent here."
   (declare (ignore session))
   ;; re-read from disk and retry briefly if empty: the turn's last records
   ;; can land after the final poll (silent 0-record collection was observed
   ;; on a pp-dm turn), and a mid-turn idle blip could exit the wait early
-  (let* ((new (collect-turn-records))
+  (let* ((all (collect-turn-records))
+         (new (above-floor all))
          (forms (mapcar #'third new))
          (texts (remove-if (lambda (s) (zerop (length (trim s))))
                            (reply-texts forms)))
@@ -1056,12 +1081,12 @@ the whole set used to duplicate the reply as one large trailing message."
          (remaining (if streaming
                         (subseq texts (min streamed (length texts)))
                         nil)))
-    (log-line "turn collected: ~d new records, ~d assistant text(s) (~d streamed)"
-              (length new) (length texts) streamed)
+    (log-line "turn collected: ~d new records (~d ours), ~d assistant text(s) (~d streamed)"
+              (length all) (length new) (length texts) streamed)
     (cond
       ((and streaming texts (null remaining))
        ;; every text already delivered live: nothing left to send
-       (advance-watermarks new) (save-state)
+       (advance-watermarks all) (save-state)
        :delivered)
       (texts
        (let* ((final (if streaming
@@ -1072,14 +1097,14 @@ the whole set used to duplicate the reply as one large trailing message."
               (out (cap-reply final)))
          (if (deliver-once peer surface out)
              (prog1 :delivered
-               (advance-watermarks new) (save-state))
+               (advance-watermarks all) (save-state))
              (progn (park-pending peer surface out)
-                    (advance-watermarks new) (save-state)
+                    (advance-watermarks all) (save-state)
                     :parked))))
       (t
-       ;; nothing textual: still advance so tool noise never leaks into
-       ;; the next turn's delta, and tell the human the turn is over
-       (advance-watermarks new) (save-state)
+       ;; nothing of ours is textual: still advance so tool noise and other
+       ;; actors' turns never leak into the next delta
+       (advance-watermarks all) (save-state)
        (if (deliver-once peer surface "(no text output)")
            :delivered
            (progn (park-pending peer surface "(no text output)")
@@ -1089,10 +1114,12 @@ the whole set used to duplicate the reply as one large trailing message."
   "Streaming surfaces deliver each assistant text as it flushes. Called
 from turn-wait so narration lands live, and once more at turn end. Only a
 successful send advances :streamed, so a failed fragment is retried on the
-next poll instead of being logged as sent and lost."
+next poll instead of being logged as sent and lost. Records at or below
+the turn floor are someone else's turn (a heartbeat, typically) and are
+never delivered."
   (declare (ignore rec))
   (when (eq (reply-policy (getf *turn* :surface)) :stream)
-    (let* ((new (all-new-records))
+    (let* ((new (above-floor (all-new-records)))
            (forms (mapcar #'third new))
            (texts (remove-if (lambda (s) (zerop (length (trim s))))
                              (reply-texts forms)))
@@ -1114,7 +1141,7 @@ next poll instead of being logged as sent and lost."
     (let ((session (getf rec :session)))
       (turn-begin)
       (setf *turn* (list :peer peer :surface surface :streamed 0
-                                :started (now)))
+                                :started (now) :floor (current-max-seq)))
       (log-line "turn start: session ~a surface ~a peer ~a"
                 session surface peer)
       (al-tell session prompt)
