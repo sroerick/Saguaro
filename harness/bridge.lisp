@@ -1127,7 +1127,7 @@ never delivered."
       (when (> (length texts) delivered)
         (let ((n delivered))
           (dolist (text (subseq texts delivered))
-            (when (deliver-once (getf *turn* :peer) (getf *turn* :surface) text)
+            (when (deliver-once (getf *turn* :peer) (getf *turn* :surface) (cap-reply text))
               (incf n)))
           (setf (getf *turn* :streamed) n
                 (getf *turn* :streamed-watermarks) new))))))
@@ -1633,6 +1633,12 @@ inside attribute values do not affect depth."
   (log-line "DM from ~a: ~a" bare (subseq body 0 (min 200 (length body))))
   ;; immediate feedback: "is typing..." the moment the DM lands
   (ignore-errors (xmpp-send-state bare :composing))
+  ;; a DM arriving mid-turn waits silently until the turn ends; say so
+  (when *turn*
+    (let ((waited (- (now) (or (getf *turn* :started) (now)))))
+      (when (> waited 10)
+        (deliver-notice bare :xmpp-private
+                        (format nil "queued - I'll read this when the current job finishes (~as so far)" waited)))))
   (enqueue bare :xmpp-private body))
 
 (defun enqueue (peer surface body)
