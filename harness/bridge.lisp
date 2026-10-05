@@ -735,7 +735,17 @@ parks the text so it is retried later, never dropped."
           ((and (= read-upto size) (string= pending ""))
            records)
           (t
-           (let* ((chunk (with-open-file (f path)
+           (let* ((chunk (with-open-file (f path
+                                          ;; file is APPENDED while we tail it;
+                                          ;; a final read can land mid-multibyte
+                                          ;; char -> strict utf-8 throws (torn
+                                          ;; sequence #(148), 2026-09-29). That
+                                          ;; throw used to reach main's blanket
+                                          ;; handler and kill the XMPP stream.
+                                          ;; :replacement makes a torn tail a
+                                          ;; placeholder; the watermark re-reads
+                                          ;; the real bytes next poll.
+                                          :external-format '(:utf-8 :replacement #\?))
                            (file-position f read-upto)
                            (slurp-exact f)))
                   (buf (concatenate 'string pending chunk)))
@@ -1814,7 +1824,7 @@ inside attribute values do not affect depth."
                                                            text))))
                              (run-turn (getf item :peer) surface prompt)))))))
               ;; 4. streaming surfaces: deliver narration as it flushes
-              (when *turn* (stream-poll nil))
+              (when *turn* (ignore-errors (stream-poll nil)))
               ;; 5. pp dm poller
               (when *pp-on*
                 (when (> (- (now) *main-last-pp-poll*) *pp-poll-secs*)
