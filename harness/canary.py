@@ -48,6 +48,22 @@ def bridge_pid():
     return None
 
 
+def newest_record_age(conv):
+    """Seconds since the newest record in conversation CONV, or None."""
+    if not conv:
+        return None
+    d = Path.home() / ".local/share/autolith/conversations" / conv
+    if not d.is_dir():
+        return None
+    files = list(d.glob("*.sexp"))
+    if not files:
+        return None
+    try:
+        return time.time() - max(f.stat().st_mtime for f in files)
+    except OSError:
+        return None
+
+
 def bridge_connected():
     """(ok, detail): the bridge process holds a TCP connection to the
     XMPP server. A tmux session can outlive a wedged client; the socket
@@ -152,7 +168,21 @@ def main():
         fail("wake: no autolith session answered status")
         return 1
     rec = recs[0]
-    print("canary: wake ok (session %s)" % rec["session"], flush=True)
+    # 2026-09-30: status answering is NOT health. Require recent turn activity.
+    age = newest_record_age(rec.get("conversation"))
+    stale_h = float(B.get("stale_turn_hours", 5))
+    if age is None:
+        fail("wake: session %s answers status but conversation %s has no records "
+             "on disk" % (rec["session"], rec.get("conversation")))
+        return 1
+    if age > stale_h * 3600:
+        fail("wake: session %s answers status but conversation %s has had NO new "
+             "records for %.1f h - the agent is not completing turns (provider "
+             "400 / over-limit context?). Check the alagent pane."
+             % (rec["session"], rec.get("conversation"), age / 3600.0))
+        return 1
+    print("canary: wake ok (session %s; newest record %.1f h old)"
+          % (rec["session"], age / 3600.0), flush=True)
 
     ok, detail = bridge_connected()
     if not ok:
