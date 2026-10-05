@@ -1360,6 +1360,7 @@ openssl can never fill the pipe and block the tunnel."
     (xmpp-send "<presence><priority>0</priority></presence>")
     (dolist (muc (cfg-list "bridge" "mucs"))
       (xmpp-join-muc muc))
+    (setf *last-inbound* (now))
     (log-line "bridge online as ~a (CL bridge)" jid)))
 
 (defun xmpp-send (&rest parts)
@@ -1417,6 +1418,7 @@ openssl can never fill the pipe and block the tunnel."
             do (let ((ch (read-char in nil :eof)))
                  (when (eq ch :eof)
                    (error "xmpp stream closed"))
+                 (setf *last-inbound* (now))
                  (setf (getf *conn* :buf)
                        (concatenate 'string (getf *conn* :buf) (string ch))))
             finally
@@ -1442,6 +1444,7 @@ Returns nil on stream close. Blocks."
         (return stanza))
       (let ((ch (read-char (getf *conn* :in) nil :eof)))
         (when (eq ch :eof) (return nil))
+        (setf *last-inbound* (now))
         (setf (getf *conn* :buf)
               (concatenate 'string (getf *conn* :buf) (string ch)))))))
 
@@ -1773,6 +1776,12 @@ inside attribute values do not affect depth."
 (defparameter *main-last-pp-poll* 0)
 (defparameter *main-last-flush* 0)
 (defparameter *main-last-task-poll* 0)
+(defparameter *main-last-xmpp-ping* 0)
+;; Last time ANY byte arrived from the xmpp tunnel — stanza, pong, or
+;; whitespace — refreshed by every read path. A stream with no inbound
+;; bytes for *xmpp-stale-secs* is dead even if TCP still says
+;; ESTABLISHED (silently dropped flow); force a reconnect.
+(defparameter *last-inbound* (get-universal-time))
 
 (defun main ()
   (load-state)
@@ -1802,6 +1811,18 @@ inside attribute values do not affect depth."
               (when (> (- (now) *main-last-keepalive*) 60)
                 (setf *main-last-keepalive* (now))
                 (xmpp-send " "))
+              ;; 2b. XEP-0199 ping every *xmpp-ping-secs*: forces a
+              ;; round-trip answer (pong or error iq) even when idle, so
+              ;; *last-inbound* stays fresh on a healthy stream.
+              (when (> (- (now) *main-last-xmpp-ping*) *xmpp-ping-secs*)
+                (setf *main-last-xmpp-ping* (now))
+                (xmpp-send (format nil "<iq id='keepalive~d' type='get'><ping xmlns='urn:xmpp:ping'/></iq>" (now))))
+              ;; 2c. no inbound bytes for *xmpp-stale-secs* — not even
+              ;; ping answers: the flow is dead (silently dropped
+              ;; middlebox state). Raise through the normal error path
+              ;; below, which closes the tunnel and reconnects.
+              (when (> (- (now) *last-inbound*) *xmpp-stale-secs*)
+                (error "xmpp stale: no inbound bytes in ~as — reconnecting" *xmpp-stale-secs*))
               ;; 3. start a queued turn if none is running
               (when (and *queue* (not *turn*))
                 (let ((item (first *queue*)))
@@ -1850,12 +1871,35 @@ inside attribute values do not affect depth."
           (setf backoff (min (* 2 backoff) 60)))))))
 
 (defun xmpp-next-stanza-with-timeout ()
-  "One stanza or nil when nothing arrived within poll granularity. The
-read below is blocking on the openssl pipe; ejabberd whitespace-pings and
-XEP-0199 pings keep the stream warm, and TCP keepalive covers dead peers."
-  (if (listen (getf *conn* :in))
-      (xmpp-next-stanza)
-      (progn (sleep 0.5) nil)))
+  "One complete stanza, or nil when nothing is fully available yet.
+NEVER blocks: tops up the buffer with whatever bytes are readable right
+now, then tries to extract one stanza. A stanza that stalls mid-stream
+stays buffered for the next pass instead of freezing the loop.
+(2026-10-05: this used to hand off to the BLOCKING xmpp-next-stanza
+whenever any byte was readable, so a partial stanza blocked read-char
+forever and froze the entire main loop — keepalive, pp-poll, task
+announce, no reconnect — for 20 hours. EOF and :stream-close now raise
+instead of returning nil, which would have spun silently forever.)"
+  (let ((in (getf *conn* :in))
+        (got 0))
+    ;; top up the buffer with whatever is readable right now
+    (loop while (listen in)
+          do (let ((ch (read-char in nil :eof)))
+               (when (eq ch :eof) (error "xmpp stream closed"))
+               (incf got)
+               (setf *last-inbound* (now))
+               (setf (getf *conn* :buf)
+                     (concatenate 'string (getf *conn* :buf) (string ch)))))
+    ;; extract at most one complete stanza from the buffer
+    (multiple-value-bind (stanza rest)
+        (extract-stanza (getf *conn* :buf))
+      (when (eq stanza :stream-close) (error "xmpp stream closed"))
+      (if stanza
+          (progn (setf (getf *conn* :buf) rest) stanza)
+          ;; idle: keep the ~0.5s loop granularity; mid-stanza: brief
+          ;; pause so a streaming stanza completes without hot-spinning
+          ;; the extract scan
+          (progn (sleep (if (plusp got) 0.05 0.5)) nil)))))
 
 ;;; ---------------------------------------------------------------------
 ;;; detached child-agent completions
@@ -1879,6 +1923,14 @@ XEP-0199 pings keep the stream warm, and TCP keepalive covers dead peers."
 
 (defparameter *task-notify-chars*
   (max (cfg-int "bridge" "task_notify_chars" 1200) 100))
+
+(defparameter *xmpp-ping-secs*
+  ;; send a XEP-0199 ping this often so idle streams get inbound traffic
+  (max (cfg-int "bridge" "xmpp_ping_secs" 600) 60))
+
+(defparameter *xmpp-stale-secs*
+  ;; no inbound bytes at all for this long => dead flow => reconnect
+  (max (cfg-int "bridge" "xmpp_stale_secs" 2700) 300))
 
 (defun plist-val (form key)
   "Plain plist lookup. kid-val assumes a leading type keyword; result.sexp
