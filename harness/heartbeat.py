@@ -102,17 +102,43 @@ def main():
             pass
 
     session, conv = rec["session"], rec["conversation"]
-    watermark = max((r["seq"] for r in bridge.all_records(conv)), default=0)
+    # per-file watermarks: a conversation's chunk files do NOT share one seq
+    # space, so a single global max(seq) masks every new turn (2026-09-24 bug).
+    mark = bridge.seq_highwater(conv)
     print("heartbeat: telling session %s" % session, flush=True)
     bridge.run([A["bin"], "localgroup", "tell", session, prompt])
 
+    # 2026-09-30: require the turn to actually RUN. Before this the loop broke
+    # out on the first poll (the session was still idle because the turn had not
+    # started yet) and an empty record set printed "nothing to report" - which is
+    # exactly what a conversation that 400s on every provider call produces.
+    became_active = False
     deadline = time.monotonic() + float(A.get("turn_timeout_secs", 900))
+    start_deadline = time.monotonic() + 180   # don't hang for hours if it never starts
     while time.monotonic() < deadline:
         time.sleep(float(A.get("poll_secs", 1.5)))
-        if agent_idle(session):
+        idle = agent_idle(session)
+        if not idle:
+            became_active = True
+        if became_active and idle:
+            break
+        if not became_active and time.monotonic() > start_deadline:
             break
 
-    new = [r for r in bridge.all_records(conv) if r["seq"] > watermark]
+    new = bridge.new_records(conv, mark)
+    if not new:
+        print("heartbeat: FAILED - the tell produced NO new records (agent not "
+              "answering; check the alagent pane for provider errors)",
+              flush=True)
+        try:
+            push(B.get("allow", [""])[0],
+                 "[heartbeat] FAILED: the agent produced no new conversation "
+                 "records this hour, so it is not actually working (likely "
+                 "provider 400s / over-limit context). Check the alagent pane "
+                 "on the hwre box.")
+        except Exception as e:
+            print("heartbeat: failure alert push failed: %s" % e, flush=True)
+        return 1
     text = bridge.reply_text(new).strip()
     if not text or text.lower().rstrip(".! ") in SKIP_SENTINELS:
         print("heartbeat: nothing to report", flush=True)

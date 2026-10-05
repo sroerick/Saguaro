@@ -60,3 +60,38 @@ MUC mention → `turn start` → `turn over: DONE` (67s) → `collected 3 new
 records, 1 assistant text` → `deliver XMPP-GROUP (8 chars)`; the room shows
 `gregor: FINAL-OK`. watchdog silent (healthy, and defers repairs mid-turn),
 canary green on all three hops, exactly one tunnel, flat RSS, 0% CPU.
+
+## Incident: post-reboot silent turns (2026-10-04)
+
+Symptom: after a clean reboot the bridge and autolith session both came up,
+the bridge logged `DM from roerick...` and `turn over: DONE`, but delivered
+`0 assistant text(s)` — gregor was online but mute.
+
+Cause: the first post-boot turn (reported 168,746 tokens, past the
+`AUTOLITH_COMPACTION_THRESHOLD=60` trigger) ran a *mid-turn* compaction whose
+summarization side-channel returned no text. Autolith raises
+`CL-LLM-PROVIDER-API:PROVIDER-PROTOCOL-ERROR` ("Compaction produced no summary
+text.") and aborts the turn before any assistant text is appended, so the
+bridge has nothing to deliver. A reboot is what put the conversation over the
+trigger at the wrong moment.
+
+Recovery (safe, non-destructive; history is untouched):
+
+    su - al -c "~/.local/bin/autolith localgroup tell E5WjMcb 'Reply with exactly: ALIVE-PROBE-OK'"
+
+This forces the pending compaction to run again; on success it appends a new
+`:SUMMARY` record and the live context drops (observed 169K -> 27K). Confirm
+with `tmux capture-pane -pt alagent -S -5` (ctx line) and
+`grep '^(:SUMMARY' ~/.local/share/autolith/conversations/<conv>/*.sexp`.
+
+Why the watchdog stayed quiet: the session is idle, the process is alive, the
+:5222 connection is live and the canary is green — the failure is only visible
+in the turn's record stream (`TURN-ABORTED`, `PROVIDER-PROTOCOL-ERROR`), which
+the watchdog does not parse. A future guard should alert when a turn completes
+with a `TURN-ABORTED` at/after its `TURN-START-SEQ` and no new assistant item.
+
+Do NOT delete watermarks or the conversation to recover: the bridge's
+watermark default is 0 (unseen), so wiping state re-delivers the last
+historical assistant message as if it answered the current request. If the
+compaction dead-end ever becomes permanent, rotate `[autolith] conv` to a
+fresh id (the documented rotation), not a conversation wipe.

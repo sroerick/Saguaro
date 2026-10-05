@@ -40,6 +40,16 @@
 # window*thr on REPORTED totals, so 524288*0.80 = 419K est maps to ~880K real
 # for the compaction upload - death either way. If the true window is ever
 # set, drop the threshold to ~40 to keep the trigger at ~210-230K est.
+# 2026-09-30 threshold 80 -> 60 (K3CL8Cm death: 36h of SILENT failure):
+# Same provider undercount as the 9/24 note below, but worse. The agent's own
+# meter read 220K/272K while the very next provider payload was 526,664 tokens
+# against the model's TRUE 524,288 window, so EVERY turn returned HTTP 400,
+# nothing was recorded and nothing was delivered for 36 h -- with no crash, no
+# restart loop, and heartbeat/canary both reporting healthy. 220K reported x
+# ~2.4 = 526K real. At 80 the trigger (217.6K reported) maps to ~521K real:
+# already past the ceiling, and the compaction upload itself 400s, so
+# compaction can never recover the conversation. At 60 the trigger is 163.2K
+# reported ~= 390K real, i.e. ~134K (26%) headroom.
 DIR="${OPENCLIWSP_DIR:-$(cd "$(dirname "$0")" && pwd)}"
 CFG="${BRIDGE_CONFIG:-$DIR/config.toml}"
 export BRIDGE_CONFIG="$CFG"
@@ -85,7 +95,7 @@ session_up() {   # $1 = tmux session name   $2 = pgrep pattern for its process
 if ! session_up alagent "autolith"; then
   tmux kill-session -t alagent 2>/dev/null || true
   tmux new-session -d -s alagent \
-    "CL_EXEC_SANDBOX_PROCESS_GROUP_HELPER=$SB_HELPER AUTOLITH_COMPACTION_THRESHOLD=80 $AL $RESUME --permissions full 2>&1"
+    "CL_EXEC_SANDBOX_PROCESS_GROUP_HELPER=$SB_HELPER AUTOLITH_COMPACTION_THRESHOLD=60 $AL $RESUME --permissions full 2>&1"
 fi
 
 # Bridge engine (2026-09-27): the Common Lisp bridge is the default; set
