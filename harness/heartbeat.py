@@ -25,7 +25,7 @@ import slixmpp
 A, B = bridge.A, bridge.B
 
 HEARTBEAT_PROMPT = (
-    "HEARTBEAT (automated hourly check-in; this is not {owner} typing). "
+    "HEARTBEAT (automated periodic check-in; this is not {owner} typing). "
     "Check your agenda, memory and papercuts for anything that needs doing "
     "or is worth reporting to {owner}. If there is nothing worth saying, "
     "reply with exactly: OK  (no other text, no markdown). Otherwise act "
@@ -93,11 +93,11 @@ def main():
             n = int(str(bridge.pp_eval('(inbox/unread %s)'
                                        % bridge.pp_lisp_str("gregor")) or 0))
             if n > 0:
-                prompt += ("\n[inbox: %d unread from %s in the PP inbox "
+                prompt += ("\n[inbox: %d unread row(s) in the PP inbox "
                            "(log/inbox); read them with (inbox/rows) via "
                            "the PP API, handle what needs handling, then "
                            "(inbox/mark-read gregor).]"
-                           % (n, B.get("owner_name", "the owner")))
+                           % n)
         except Exception:
             pass
 
