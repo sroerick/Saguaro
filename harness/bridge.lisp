@@ -405,10 +405,11 @@ OpenBSD SBCL rejects run-program :output :string, hence pipes (glochid)."
 ;;; (:version 1
 ;;;  :watermarks ((".../0001.sexp" . 6300) ...)
 ;;;  :parked ((:peer ".." :surface pp-dm :texts (".." ...)) ...))
+;;;  :queue   ((:peer ".." :surface .. :bodies (".." ...)) ...))
 ;;; ---------------------------------------------------------------------
 
 (defparameter *state*
-  (list :version 1 :watermarks '() :parked '()))
+  (list :version 1 :watermarks '() :parked '() :queue '()))
 
 (defun load-state ()
   (let ((raw (read-file-string *state-path*)))
@@ -421,8 +422,8 @@ OpenBSD SBCL rejects run-program :output :string, hence pipes (glochid)."
             (when (and (listp form) (eq (getf form :version) 1))
               (setf *state* form)))
         (error (e) (format t "state: unreadable, starting fresh: ~a~%" e))))
-    (unless (getf *state* :version)
-      (setf *state* (list :version 1 :watermarks '() :parked '())))))
+      (unless (getf *state* :version)
+          (setf *state* (list :version 1 :watermarks '() :parked '() :queue '())))))
 
 (defun save-state ()
   "Persist watermarks + parked deliveries. A failure here means replies can
@@ -1338,6 +1339,35 @@ openssl can never fill the pipe and block the tunnel."
     p))
 
 (defparameter *openssl-last-error* nil)
+(defun kill-transport ()
+  "Tear down the s_client child for real: stdin EOF (openssl exits on it),
+then SIGTERM as a backstop, bounded waits, and only then process-close.
+process-close alone just closes the pipes and leaks the child (PPID 1,
+unreaped) — one orphan per reconnect/bounce/crash, observed 2026-10-09."
+  (let ((p (and *conn* (getf *conn* :proc))))
+    (when p
+      (setf (getf *conn* :proc) nil)
+      (ignore-errors (close (sb-ext:process-input p)))
+      (loop repeat 30
+            while (ignore-errors (sb-ext:process-alive-p p))
+            do (sleep 0.1))
+      (when (ignore-errors (sb-ext:process-alive-p p))
+        (ignore-errors (sb-ext:process-kill p 15))
+        (loop repeat 20
+              while (ignore-errors (sb-ext:process-alive-p p))
+              do (sleep 0.1)))
+      (ignore-errors (sb-ext:process-close p)))))
+
+(defun kill-orphan-transports ()
+  "Kill parentless (PPID 1) openssl s_client XMPP transports left behind by a
+previous crash or bounce, before we spawn our own. Only PPID-1 children
+match: our own live child has our pid, and the ps/awk pipeline's own argv
+never is the transport command line itself."
+  (let* ((ps "ps -ax -o pid=,ppid=,args= | awk '/openssl s_client/ && $2==1 {printf \"%s \", $1}'")
+         (pids (string-trim " " (nth-value 0 (run-capture (list "/bin/sh" "-c" ps) 5)))))
+    (when (plusp (length pids))
+      (run-capture (list "/bin/sh" "-c" (concatenate 'string "kill " pids)) 5)
+      (log-line "reaper: killed orphan transports: ~a" pids))))
 
 (defun xmpp-stream-header ()
   (xmpp-send
@@ -1752,13 +1782,21 @@ inside attribute values do not affect depth."
                         (format nil "queued - I'll read this when the current job finishes (~as so far)" waited)))))
   (enqueue bare :xmpp-private body))
 
+(defun queue-sync ()
+  "Mirror *queue* into *state* and persist. A message queued here survives a
+bounce: main restores it on start and it runs, instead of dying with the
+in-memory-only queue (lost DM observed 2026-10-09 ~06:50)."
+  (setf (getf *state* :queue) *queue*)
+  (save-state))
+
 (defun enqueue (peer surface body)
   (let ((item (find peer *queue* :key (lambda (q) (getf q :peer))
                     :test #'string=)))
     (if item
         (push body (getf item :bodies))
         (push (list :peer peer :surface surface :bodies (list body))
-              *queue*))))
+              *queue*))
+    (queue-sync)))
 
 (defun queue-flatten (item)
   "Oldest body first."
@@ -1883,7 +1921,12 @@ inside attribute values do not affect depth."
 
 (defun main ()
   (load-state)
+  ;; kill parentless s_client transports from a previous crash/bounce
+  ;; BEFORE we spawn our own (else they spin at PPID 1 forever)
+  (kill-orphan-transports)
   (log-line "CL bridge starting (config ~a)" *config-path*)
+  ;; restore anything queued when a previous run died (see queue-sync)
+  (setf *queue* (getf *state* :queue))
   ;; NOTE: reap AFTER connecting. reap-orphan may wait on an in-flight turn,
   ;; and running it first took gregor fully offline (no stanza reading, no
   ;; ping answers) until that turn ended — observed 2026-09-27.
@@ -1894,10 +1937,12 @@ inside attribute values do not affect depth."
       (handler-case (progn (xmpp-connect) (setf backoff 5)
                            (reap-orphan))
         (error (e)
-          (log-line "connect failed: ~a — retry in ~ds" e backoff)
-          (sleep backoff)
-          (setf backoff (min (* 2 backoff) 60))
-          (return)))
+            (log-line "connect failed: ~a — retry in ~ds" e backoff)
+            (kill-transport)
+            (setf *conn* nil)
+            (sleep backoff)
+            (setf backoff (min (* 2 backoff) 60))
+            (return)))
       ;; serve until the stream dies
       (handler-case
           (progn
@@ -1927,6 +1972,7 @@ inside attribute values do not affect depth."
               (when (and *queue* (not *turn*))
                 (let ((item (first *queue*)))
                   (setf *queue* (rest *queue*))
+                    (queue-sync)  ; remainder persisted; item now rides the turn
                   (let ((bodies (queue-flatten item)))
                     (cond ((and (= (length bodies) 1)
                                 (string-equal (trim (first bodies)) "reset"))
@@ -1965,8 +2011,8 @@ inside attribute values do not affect depth."
                   (flush-parked)))))
         (error (e)
           (log-line "main loop error: ~a — reconnecting in ~ds" e backoff)
-          (ignore-errors (sb-ext:process-close (getf *conn* :proc)))
-          (setf *conn* nil)
+            (kill-transport)
+            (setf *conn* nil)
           (sleep backoff)
           (setf backoff (min (* 2 backoff) 60)))))))
 
