@@ -13,6 +13,10 @@
 ;;;; Contract, same as the Python originals:
 ;;;;   - random per-shot resource: the live bridge holds "autolith"; a
 ;;;;     second bind on that resource would kick the bridge off the server.
+;;;;   - MUC joins run under muc_nick-say, never the live bridge's own
+;;;;     nick: a same-JID rejoin under the bridge's nick would transfer
+;;;;     (silently strip) its room occupancy - the server raises no
+;;;;     conflict for the same bare JID.
 ;;;;   - ROOM must be listed under [bridge] mucs in config.toml; that list
 ;;;;     is the authorization boundary.
 ;;;;   - exit 0 = the stanza was handed to the stream; delivery is NOT
@@ -109,7 +113,7 @@
    Returns (values :ok history) with history as (hh:mm nick body) triplets
    in arrival order — delayed messages only; live traffic during the
    window is not history — or (values :conflict nil) when the server
-   rejected the nickname (the live bridge may hold it)."
+   rejected the nickname (another say one-shot may hold it)."
   (xmpp-send (format nil "<presence to='~a/~a'><x xmlns='http://jabber.org/protocol/muc'><history maxstanzas='~d'/></x></presence>"
                      (xml-escape room) (xml-escape nick) maxstanzas))
   (let ((hist '()) (self-seen nil) (last (now)) (deadline (+ (now) 20)))
@@ -152,19 +156,25 @@
     (values :ok (nreverse hist))))
 
 (defun say-join (room maxstanzas quiet-secs)
-  "Join ROOM under the configured muc nick; on a nickname conflict (the
-   live bridge holds it), retry once as nick-say. Returns (values nick
-   history)."
-  (let ((base (cfg-str "bridge" "muc_nick" "agent")))
-    (multiple-value-bind (r hist) (say-join-once room base maxstanzas quiet-secs)
+  "Join ROOM under muc_nick-say - deliberately NOT the configured muc
+nick: the live bridge occupies that nick, and a same-JID rejoin under it
+would transfer the room occupancy away from the bridge (the server
+raises no conflict for the same bare JID). On a conflict (another say
+one-shot holds the nick), retry once as nick-say-2. Returns (values
+nick history)."
+  (let* ((base (cfg-str "bridge" "muc_nick" "agent"))
+         (nick (concatenate 'string base "-say")))
+    (multiple-value-bind (r hist)
+        (say-join-once room nick maxstanzas quiet-secs)
       (if (eq r :ok)
-          (values base hist)
-          (let ((alt (concatenate 'string base "-say")))
+          (values nick hist)
+          (let ((alt (concatenate 'string nick "-2")))
             (multiple-value-bind (r2 hist2)
                 (say-join-once room alt maxstanzas quiet-secs)
               (if (eq r2 :ok)
                   (values alt hist2)
-                  (error "nickname conflict in ~a (tried ~a and ~a)" room base alt))))))))
+                  (error "nickname conflict in ~a (tried ~a and ~a)"
+                         room nick alt))))))))
 
 (defun say-stdin-all ()
   (with-output-to-string (o)

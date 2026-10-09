@@ -29,10 +29,14 @@ Same CLIs as the Python trio they replace (`dm_send.py` / `muc_send.py` /
 Mechanics: say.lisp loads bridge.lisp as a library — `SAGUARO_NO_MAIN=1`
 goes up before the load so `(main)` never runs — binds a RANDOM per-shot
 resource (the live bridge holds the configured one; a second bind on it
-would kick the bridge off the server), sends, and closes. Room joins wait
-for real self-presence (status 110, nickname conflict retried as
-`nick-say`); history is the delay-stamped replay collected during the
-join window. Rooms must be listed under `[bridge] mucs` — that list stays
+would kick the bridge off the server), sends, and closes. Room joins run
+under `<muc_nick>-say` - deliberately NOT the configured nick: a same-JID
+rejoin under the bridge's own nick would transfer (silently strip) its
+room occupancy, and the server raises no conflict for the same bare JID;
+a conflict with another say one-shot retries as `<nick>-say-2`. Joins
+still wait for real self-presence (status 110); history is the
+delay-stamped replay collected during the join window. Rooms must be
+listed under `[bridge] mucs` - that list stays
 the authorization boundary. Exit 0 = stanza handed to the stream
 (delivery not confirmed), 1 = failure.
 
