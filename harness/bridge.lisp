@@ -1010,8 +1010,10 @@ collect-turn-records), which retries briefly rather than stalling everyone."
     (loop
       (sleep *al-poll-secs*)
       (incf waited *al-poll-secs*)
-      ;; keep the xmpp stream warm while the agent works
-      (ignore-errors (xmpp-poll-nonblocking))
+        ;; keep the xmpp stream warm while the agent works; also fire any
+        ;; due MUC heal (the main loop is parked here until the turn ends)
+        (ignore-errors (xmpp-poll-nonblocking))
+        (ignore-errors (muc-rejoin-due))
       ;; deliver narration as it flushes while the turn runs
       (when *turn* (ignore-errors (stream-poll nil)))
       ;; refresh "is typing" while work is in progress. Covers both a live
@@ -1684,9 +1686,15 @@ inside attribute values do not affect depth."
                   (log-line "MUC ~a: occupancy confirmed (heal done)" room)))
                ;; nick change: still in the room, nothing to heal
                ((member 303 codes))
-               ;; removed (kick/displacement/affiliation) or join error: heal
-               ((or (equal type "unavailable") (equal type "error"))
-                (muc-schedule-rejoin room)))))))
+                 ;; removed for real (301 ban, 307 kick, 321/322 affiliation
+                 ;; or membership, 332/333 shutdown) or join error: heal.
+                 ;; Bare self-unavailable is occupancy-transfer noise (old
+                 ;; session teardown after a restart, observed 06:03 on
+                 ;; 10-09); scheduling on it would rejoin while already in.
+                 ((or (equal type "error")
+                      (and (equal type "unavailable")
+                           (intersection codes '(301 307 321 322 332 333))))
+                  (muc-schedule-rejoin room)))))))
     ;; messages
     ((xml-stanza-name-is stanza "message")
      (let* ((type (or (xml-attr stanza "type") "normal"))
