@@ -81,10 +81,15 @@
     (xmpp-send "<presence><priority>0</priority></presence>")))
 
 (defun say-close ()
-  "Clean one-shot exit: end the stream, close the tunnel."
+  "Clean one-shot exit: end the stream, then the full kill-transport
+teardown (stdin EOF, SIGTERM backstop, bounded waits, process-close).
+process-close alone just closes the pipes and leaks the s_client child
+(PPID 1, unreaped) - one orphan per send, the same bug bridge.lisp grew
+out of 2026-10-09 (commit 7ba7fc4); say.lisp loads bridge.lisp as a
+library, so the real teardown is already in this image."
   (when *conn*
     (ignore-errors (xmpp-send "</stream:stream>"))
-    (ignore-errors (sb-ext:process-close (getf *conn* :proc)))
+    (kill-transport)
     (setf *conn* nil)))
 
 (defun say-delay-stamp (stanza)
