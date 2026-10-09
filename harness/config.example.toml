@@ -1,8 +1,8 @@
-# Copy to bridge.toml (chmod 600) and fill in. Never commit the real one.
+# Copy to config.toml (chmod 600) and fill in. Never commit the real one.
 
 [bridge]
 jid = "agent@chat.example.net"
-password_file = "/home/agent/opencliwsp/xmpp.password"   # one line, 0600
+password_file = "/home/agent/saguaro/harness/xmpp.password"   # one line, 0600
 allow = ["owner@chat.example.net"]        # 1:1 senders the bridge obeys
 allow_domain = ""                          # optional: trust a whole domain
 mucs = ["ops@conference.chat.example.net"] # rooms to join (muc_send/history must match)

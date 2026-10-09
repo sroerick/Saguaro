@@ -1,4 +1,4 @@
 engine:    autolith (github.com/lambda-symbolics/autolith)
-tested:    v0.46.1  (in production on this stack since 2026-09-02)
-latest:    v0.49.0  (upstream release 2026-09-08)
+tested:    v0.50.0  (in production on this stack since 2026-09-19)
+latest:    v0.60.0  (upstream release 2026-10-09; installed here, soak pending)
 policy:    pin conservatively; bump after a soak on your own deployment

@@ -1,4 +1,4 @@
-bridge.toml
+config.toml
 xmpp.password
 *.log
 venv/
