@@ -40,8 +40,8 @@ Zero-Python soak (started 10-09): the recurring Python senders ride this
 stack too — heartbeat.py's owner push and canary.py's deliver hop call
 `say.lisp dm` / `say.lisp muc` instead of their own slixmpp clients.
 slixmpp now remains only in bridge.py (the BRIDGE_ENGINE=python
-fallback). The canary itself stays disarmed ([bridge] canary = "off")
-pending roerick.
+fallback). The canary is armed (10-09, roerick ok'd): the watchdog runs
+it hourly ([bridge] canary_secs = 3600) and pages the owner on failure.
 
 ## Why it exists (the three silent-turn bugs)
 
