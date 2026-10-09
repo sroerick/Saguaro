@@ -89,6 +89,22 @@
 
 (defparameter *turn-mark-path* (home-path ".cache/saguaro-turn-active"))
 
+;; A turn that produced NO assistant text. Autolith aborts such a turn on
+;; PROVIDER-PROTOCOL-ERROR "Compaction produced no summary text." (a failed
+;; mid-turn compaction) BEFORE writing any record, so there is nothing to
+;; deliver and the failure is invisible to the watchdog. Overwritten on each
+;; such turn; watchdog.py keeps its own alerted-watermark and pages the owner.
+(defparameter *no-text-mark-path* (home-path ".cache/saguaro-no-text-turn"))
+
+(defun mark-no-text-turn (all new)
+  "Record a 0-assistant-text turn for the watchdog (best effort)."
+  (ignore-errors
+    (with-open-file (f *no-text-mark-path* :direction :output
+                       :if-exists :supersede :if-does-not-exist :create)
+      (format f "~a no-text turn: ~d new records, ~d ours, conv ~a~%"
+              (timestamp-string) (length all) (length new)
+              (or *al-conv* "?")))))
+
 (defun split-seq (s sep)
   (loop for start = 0 then (1+ end)
         for end = (position sep s :start start)
@@ -1116,11 +1132,19 @@ live, so only texts past :streamed are sent here."
                     :parked))))
       (t
        ;; nothing of ours is textual: still advance so tool noise and other
-       ;; actors' turns never leak into the next delta
+       ;; actors' turns never leak into the next delta.
+       ;; This is the compaction-failure signature (0 assistant texts, the
+       ;; turn aborted before writing): mark it so the watchdog can page the
+       ;; owner with a diagnosis instead of leaving a cryptic reply.
+       (log-line "NO-TEXT TURN: 0 assistant texts (~d new, ~d ours) - likely a compaction/provider failure"
+                 (length all) (length new))
+       (mark-no-text-turn all new)
        (advance-watermarks all) (save-state)
-       (if (deliver-once peer surface "(no text output)")
+       (if (deliver-once peer surface
+                         "(no text output - the turn wrote no assistant text; likely a compaction failure at large context. Watchdog alerted.)")
            :delivered
-           (progn (park-pending peer surface "(no text output)")
+           (progn (park-pending peer surface
+                                "(no text output - the turn wrote no assistant text; likely a compaction failure at large context. Watchdog alerted.)")
                   :parked))))))
 
 (defun stream-poll (rec)

@@ -47,6 +47,17 @@ BRIDGE_RESTART_MARK = Path.home() / ".cache" / "saguaro-bridge-restart"
 # exactly the "he was typing, then nothing" report of 2026-09-23.
 TURN_MARK = Path.home() / ".cache" / "saguaro-turn-active"
 TURN_DEFER_SECS = float(A.get("turn_timeout_secs", 900)) + 600
+# --- no-text turn guard (added 2026-10-09) ---------------------------------
+# A turn can end with 0 assistant texts: at large context autolith runs a
+# mid-turn compaction whose summarization call comes back with no visible
+# text, raises PROVIDER-PROTOCOL-ERROR "Compaction produced no summary text."
+# and aborts the turn before writing any record. The bridge still delivers
+# "(no text output)" to the peer, but that is cryptic and the watchdog stayed
+# silent (no crash, session idle, :5222 live). bridge.lisp writes NO_TEXT_MARK
+# on such a turn; page the owner once per marker.
+NO_TEXT_MARK = Path.home() / ".cache" / "saguaro-no-text-turn"
+NO_TEXT_ALERTED = Path.home() / ".cache" / "saguaro-no-text-alerted"
+NO_TEXT_MAX_AGE = 7200  # ignore a marker older than this (stale)
 
 
 def sh(cmd, timeout=90):
@@ -186,6 +197,35 @@ def capture_crash(tag):
         print("watchdog: crash captured to crash-%s.log" % stamp, flush=True)
     except Exception as e:
         print("watchdog: crash capture failed: %s" % e, flush=True)
+
+
+def check_no_text_turn():
+    """Page the owner when the bridge reports a turn with no assistant text."""
+    try:
+        age = time.time() - NO_TEXT_MARK.stat().st_mtime
+    except OSError:
+        return
+    if age > NO_TEXT_MAX_AGE:
+        return
+    try:
+        if NO_TEXT_ALERTED.stat().st_mtime >= NO_TEXT_MARK.stat().st_mtime:
+            return
+    except OSError:
+        pass
+    try:
+        NO_TEXT_ALERTED.touch()
+    except OSError:
+        pass
+    try:
+        push(B["allow"][0],
+             "the agent's last turn produced NO assistant text (%.0f min ago)"
+             " - usually a compaction failure at large context (autolith: "
+             "\"Compaction produced no summary text.\"), which aborts the turn "
+             "before it writes anything, so the reply was lost. Re-ask. If it "
+             "repeats, the standing conversation needs a forced compaction "
+             "re-run (localgroup tell) or a rotation." % (age / 60.0))
+    except Exception as e:
+        print("watchdog: push failed: %s" % e, flush=True)
 
 
 def bridge_restart_recent():
@@ -330,6 +370,8 @@ def main():
         except Exception as e:
             print("watchdog: push failed: %s" % e, flush=True)
         return
+
+    check_no_text_turn()
 
     if canary_due():
         try:
