@@ -34,14 +34,14 @@ proactively, without becoming noisy.
   sessions). Generates the persona file on first boot (see below).
 - `scripts/gen_agents.py` + `persona.tmpl.md` - generate the agent's
   workspace persona file (AGENTS.md) from the template, filling
-  owner/agent/host from bridge.toml. Refuses to overwrite: after first
+  owner/agent/host from config.toml. Refuses to overwrite: after first
   generation the file belongs to the user.
 - `scripts/smoke.py` - commissioning diagnostic: tell the agent an
   expression, poll, print the reply.
 
 ## Setup
 1. Python 3.11+; `python3 -m venv venv && venv/bin/pip install -r requirements.txt`
-2. `cp config.example.toml bridge.toml` (chmod 600); create `xmpp.password` (0600)
+2. `cp config.example.toml config.toml` (chmod 600); create `xmpp.password` (0600)
 3. Install the two cron lines from `crontab.example`
 4. `./start-sessions.sh`  (boot: call it from rc.local or the user's profile)
 

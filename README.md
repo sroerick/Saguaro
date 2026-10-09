@@ -3,24 +3,29 @@
 An always-on personal AI agent on your own box, in an evening.
 
 saguaro is the runnable distribution of an autolith-based agent: the Lisp
-image (autolith, the mind) plus the Python keep-alive harness (the body) --
-an XMPP bridge, heartbeat, watchdog, and boot scripts. Your agent runs
+image (autolith, the mind) plus the keep-alive harness (the body) -- a
+zero-dependency Common Lisp XMPP bridge, Python heartbeat/watchdog, and
+boot scripts. Your agent runs
 detached in tmux, talks to you from any XMPP client, initiates messages on
 its own schedule, and survives crashes and reboots without hand-holding.
 
     XMPP client (you@anywhere)
         | 1:1 chat + MUC rooms
         v
-    harness/bridge.py (slixmpp)  <-->  autolith session (SBCL, tmux)
+    harness/bridge.lisp (SBCL)   <-->  autolith session (SBCL, tmux)
         ^                                    |
     heartbeat.py / watchdog.py         model provider (API)
         (cron: keep it alive)
 
+The shipped bridge is the Common Lisp one (harness/README-bridge-CL.md);
+`bridge.py` (slixmpp) ships as the fallback via `BRIDGE_ENGINE=python
+start-sessions.sh`. The Python venv is for heartbeat, watchdog, canary,
+and the helper scripts.
 ## What's in the box
 
 | piece       | what                                                   |
 |-------------|--------------------------------------------------------|
-| harness/    | XMPP bridge + heartbeat + watchdog + boot (Python, MIT)|
+| harness/    | CL XMPP bridge + Python heartbeat/watchdog/canary + boot (MIT)|
 | pp_mirror/  | optional Pricklypear-backed memory store (ISC, vendored nopalito) |
 | RUNBOOK.md  | zero-to-agent install and wiring                       |
 | ENGINE_PIN  | autolith version this release is tested against        |

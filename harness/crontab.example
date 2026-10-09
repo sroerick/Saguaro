@@ -1,3 +1,5 @@
 # user crontab (crontab -e). Adjust paths to your checkout.
-13 * * * * /home/agent/xmpp-bridge/venv/bin/python /home/agent/xmpp-bridge/heartbeat.py >> /home/agent/xmpp-bridge/heartbeat.log 2>&1
-*/5 * * * * /home/agent/xmpp-bridge/venv/bin/python /home/agent/xmpp-bridge/watchdog.py >> /home/agent/xmpp-bridge/watchdog.log 2>&1
+13 * * * * /home/agent/saguaro/harness/venv/bin/python /home/agent/saguaro/harness/heartbeat.py >> /home/agent/saguaro/harness/heartbeat.log 2>&1
+*/5 * * * * /home/agent/saguaro/harness/venv/bin/python /home/agent/saguaro/harness/watchdog.py >> /home/agent/saguaro/harness/watchdog.log 2>&1
+# optional: weekly wire-cost profile; see harness/scripts/cost-profile.py
+#20 15 * * 1 /home/agent/saguaro/harness/venv/bin/python /home/agent/saguaro/harness/scripts/cost-profile.py --days 7 >> /home/agent/saguaro/harness/cost-profile.log 2>&1

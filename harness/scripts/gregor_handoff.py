@@ -11,11 +11,11 @@ import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, "/home/al/saguaro-live/harness")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import bridge  # noqa: E402
 
 CONV = sys.argv[1] if len(sys.argv) > 1 else "K3CL8Cm"
-OUT = Path(sys.argv[2] if len(sys.argv) > 2 else "/home/al/HANDOFF-from-K3CL8Cm.md")
+OUT = Path(sys.argv[2] if len(sys.argv) > 2 else f"HANDOFF-{CONV}.md")
 MAX_CHARS = int(sys.argv[3]) if len(sys.argv) > 3 else 60000
 
 

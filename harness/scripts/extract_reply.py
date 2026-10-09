@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Print the assistant text of conversation CONV (last 8000 chars)."""
+import os
 import sys
 
-sys.path.insert(0, "/home/al/saguaro-live/harness")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import bridge  # noqa: E402
 
 conv = sys.argv[1]
