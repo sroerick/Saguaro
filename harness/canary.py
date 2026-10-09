@@ -17,8 +17,7 @@ Run by watchdog.py on the [bridge] canary cadence, or by hand:
 One log line per hop on success (goes to watchdog.log when cron-run);
 exit 0. On failure: best-effort XMPP alert to the owner, exit 1.
 """
-import asyncio
-import slixmpp
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -28,7 +27,7 @@ import bridge
 from heartbeat import push
 
 B = bridge.B
-XMPP_C2S_PORT = "5222"   # slixmpp ClientXMPP default; revisit if the server moves
+XMPP_C2S_PORT = "5222"   # standard client-to-server port; revisit if the server moves
 
 
 def bridge_pid():
@@ -85,64 +84,23 @@ def bridge_connected():
     return True, hits[0].split()[-1]
 
 
-class Probe(slixmpp.ClientXMPP):
-    """One-shot client: authenticate, join the canary room, post one
-    line, disconnect. self.stage records how far it got."""
-
-    def __init__(self, room, line, nick):
-        pw = Path(B["password_file"]).read_text().strip()
-        super().__init__(B["jid"], pw)
-        self.register_plugin("xep_0045")
-        self.room, self.line, self.nick = room, line, nick
-        self.stage = "auth"
-        self.done = asyncio.Event()
-        self.add_event_handler("session_start", self.on_start)
-        self.add_event_handler("failed_auth", self.on_fail)
-        # NOTE: no connection_failed handler on purpose - the server
-        # occasionally answers the FIRST TLS handshake with a protocol
-        # version alert, and slixmpp's connect loop retries successfully
-        # ~1s later. Bailing out on that event would fail the canary on
-        # a healthy path; the wait_for timeout is the real bound.
-
-    def on_fail(self, e):
-        if self.stage == "auth":
-            self.stage = "auth failed (%s)" % type(e).__name__
-        self.done.set()
-
-    async def on_start(self, e):
-        self.stage = "deliver"
-        try:
-            await self.plugin["xep_0045"].join_muc_wait(
-                self.room, self.nick, timeout=15)
-            await asyncio.sleep(0.5)   # let the join presence settle
-            self.send_message(mto=self.room, mbody=self.line,
-                              mtype="groupchat")
-            await asyncio.sleep(1.0)   # let the stanza flush
-        except Exception as e:
-            self.stage = "deliver failed: %s: %s" % (type(e).__name__, e)
-        self.done.set()
-
-
-async def probe(room, nick, line):
-    p = Probe(room, line, nick)
-    p.connect()
+def probe(room, nick, line):
+    """One-shot deliver through the bridge's own xmpp stack (say.lisp):
+    authenticate, bind, join the room, post one line, disconnect. Covers
+    the old connect+deliver hops (fresh credentials every run, so a
+    rotated password still fails loudly). The join nick is the configured
+    muc_nick with a nick-say fallback on conflict with the live bridge."""
+    say = Path(__file__).resolve().parent / "say.lisp"
     try:
-        await asyncio.wait_for(p.done.wait(), timeout=45)
-        await asyncio.sleep(0.3)   # let the socket close quietly
-    except asyncio.TimeoutError:
-        return False, "probe timed out at stage %s" % p.stage
-    finally:
-        try:
-            d = p.disconnect()
-            if asyncio.iscoroutine(d):
-                await asyncio.wait_for(d, timeout=5)
-        except Exception:
-            pass
-    if p.stage.startswith("auth"):
-        return False, "XMPP %s (check password_file)" % p.stage
-    if p.stage.startswith("deliver failed"):
-        return False, p.stage
-    return True, "delivered to %s as %s" % (room, nick)
+        proc = subprocess.run(
+            ["/usr/local/bin/sbcl", "--script", str(say), "muc", room, line],
+            capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return False, "say.lisp muc timed out after 60s"
+    out = " ".join((proc.stdout + " " + proc.stderr).split())
+    if proc.returncode != 0:
+        return False, "say.lisp muc failed (rc=%d): %s" % (proc.returncode, out)
+    return True, "delivered to %s via say.lisp" % room
 
 
 def fail(msg):
@@ -195,7 +153,7 @@ def main():
         return 1
     line = ("[canary] ok - chat path alive (wake+connect+deliver, %.1fs)"
             % (time.time() - t0))
-    ok, detail = asyncio.run(probe(room, nick, line))
+    ok, detail = probe(room, nick, line)
     if not ok:
         fail("deliver: %s" % detail)
         return 1
