@@ -1429,7 +1429,8 @@ openssl can never fill the pipe and block the tunnel."
                   (setf (getf *conn* :buf) rest)
                   (dispatch-stanza el))
                 (when (eq el :stream-close)
-                  (error "xmpp stream closed")))))))
+                  (error "xmpp stream closed"))
+                (muc-rejoin-due))))))
 
 (defun xmpp-next-stanza ()
   "One complete top-level stream element, as its raw string.
@@ -1584,6 +1585,75 @@ inside attribute values do not affect depth."
              (string= from (format nil "@~a" dom)
                       :start1 (- (length from) (1+ (length dom))))))))
 
+;;; ---------------------------------------------------------------------
+;;; MUC self-heal
+;;;
+;;; The server never 409s a same-bare-JID rejoin: joining a room with our
+;;; own nick silently transfers room occupancy (observed 2026-10-09, the
+;;; armed canary's pre-say-lisp run displaced ops-test). say.lisp now
+;;; joins under muc_nick-say, but kicks, affiliation changes, or a
+;;; server-side purge can still strip a room while the stream stays up,
+;;; and this bridge used to rejoin only at startup. So: watch our own
+;;; MUC presence. Self unavailable (minus a 303 nick change) or a join
+;;; error schedules a rejoin with per-room backoff; self-presence 110 on
+;;; entry clears the pending heal.
+;;; ---------------------------------------------------------------------
+
+(defparameter *muc-rejoin* '()
+  "Pending MUC heals: ((room attempts due-ut) ...). In-memory only; a
+   stream reconnect rejoins every configured room anyway.")
+
+(defun muc-status-codes (stanza)
+  "All <status code='NNN'/> integers in a MUC presence stanza, in order."
+  (let ((codes '()))
+    (loop for i = 0 then (+ hit 7)
+          for hit = (search "<status" stanza :start2 i)
+          while hit
+          do (let* ((gt (position #\> stanza :start hit))
+                    (tag (and gt (subseq stanza hit gt)))
+                    (k (and tag (search "code=" tag))))
+               (when (and k (< (+ k 6) (length tag)))
+                 (let* ((q (char tag (+ k 5)))
+                        (start (+ k 6))
+                        (end (position q tag :start start)))
+                   (when end
+                     (let ((n (parse-integer tag :start start
+                                             :end end :junk-allowed t)))
+                       (when n (push n codes))))))))
+    (nreverse codes)))
+
+(defun muc-heal-delay (attempts)
+  "Backoff seconds before heal attempt N."
+  (nth (min (1- attempts) 4) '(2 10 30 120 300)))
+
+(defun muc-schedule-rejoin (room)
+  (let* ((entry (assoc room *muc-rejoin* :test #'string=))
+         (attempts (1+ (if entry (second entry) 0)))
+         (delay (muc-heal-delay attempts)))
+    (if entry
+        (setf (second entry) attempts
+              (third entry) (+ (now) delay))
+        (push (list room attempts (+ (now) delay)) *muc-rejoin*))
+    (log-line "MUC ~a: occupancy lost - rejoin in ~as (heal attempt ~d)"
+              room delay attempts)))
+
+(defun muc-clear-rejoin (room)
+  "Drop a pending heal for ROOM. Returns t when one was pending."
+  (let ((had (assoc room *muc-rejoin* :test #'string=)))
+    (setf *muc-rejoin*
+          (remove room *muc-rejoin* :key #'first :test #'string=))
+    (and had t)))
+
+(defun muc-rejoin-due ()
+  "Fire pending MUC heals whose backoff has elapsed. Runs from the main
+   loop and from xmpp-poll-nonblocking, so a loss mid-turn heals too."
+  (dolist (entry *muc-rejoin*)
+    (when (>= (now) (third entry))
+      (let ((room (first entry)))
+        (muc-clear-rejoin room)
+        (log-line "MUC ~a: heal rejoin" room)
+        (xmpp-join-muc room)))))
+
 (defun dispatch-stanza (stanza)
   (cond
     ;; XEP-0199 ping
@@ -1595,8 +1665,28 @@ inside attribute values do not affect depth."
        (xmpp-send (format nil "<iq id='~a' type='result'~a/>"
                           (xml-escape id)
                           (if from (format nil " to='~a'" (xml-escape from)) "")))))
-    ;; presence from MUC (status codes: skip ban/kick noise)
-    ((xml-stanza-name-is stanza "presence") nil)
+      ;; presence: our own MUC presence drives the self-heal (see
+      ;; *muc-rejoin*); other occupants' join/leave/kick noise is ignored.
+      ((xml-stanza-name-is stanza "presence")
+       (let* ((from (or (xml-attr stanza "from") ""))
+              (slash (position #\/ from))
+              (room (and slash (subseq from 0 slash)))
+              (nick (and slash (subseq from (1+ slash))))
+              (type (xml-attr stanza "type")))
+         (when (and room nick
+                    (member room (cfg-list "bridge" "mucs") :test #'string=)
+                    (string= nick (cfg-str "bridge" "muc_nick" "agent")))
+           (let ((codes (muc-status-codes stanza)))
+             (cond
+               ;; our join settled: self-presence on entry clears any heal
+               ((and (null type) (member 110 codes))
+                (when (muc-clear-rejoin room)
+                  (log-line "MUC ~a: occupancy confirmed (heal done)" room)))
+               ;; nick change: still in the room, nothing to heal
+               ((member 303 codes))
+               ;; removed (kick/displacement/affiliation) or join error: heal
+               ((or (equal type "unavailable") (equal type "error"))
+                (muc-schedule-rejoin room)))))))
     ;; messages
     ((xml-stanza-name-is stanza "message")
      (let* ((type (or (xml-attr stanza "type") "normal"))
@@ -1823,6 +1913,8 @@ inside attribute values do not affect depth."
               ;; below, which closes the tunnel and reconnects.
               (when (> (- (now) *last-inbound*) *xmpp-stale-secs*)
                 (error "xmpp stale: no inbound bytes in ~as — reconnecting" *xmpp-stale-secs*))
+              ;; 2d. MUC self-heal: fire any due room rejoin (*muc-rejoin*)
+              (muc-rejoin-due)
               ;; 3. start a queued turn if none is running
               (when (and *queue* (not *turn*))
                 (let ((item (first *queue*)))
