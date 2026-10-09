@@ -4,3 +4,4 @@ config.toml
 *.password
 *.log
 persona.md
+bridge.err*
