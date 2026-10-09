@@ -28,11 +28,10 @@ proactively, without becoming noisy.
   6s, no external sockets, conversation log not flushed 10+ min) triggers
   the kill+resume drill. Conversation history survives; the owner gets an
   alert.
-- `dm_send.py`, `muc_send.py`, `muc_history.py` - one-shot DM/MUC
-  post/history tools the agent itself shells out to. SUPERSEDED
-  2026-10-09 by `say.lisp` (CL, same CLIs, loads bridge.lisp as a
-  library - no slixmpp/venv needed); kept until the zero-Python soak
-  completes. See README-bridge-CL.md.
+- `dm_send.py`, `muc_send.py`, `muc_history.py` - RETIRED 2026-10-09,
+  deleted after the zero-Python soak started green. `say.lisp` (CL,
+  same CLIs, loads bridge.lisp as a library) is the one-shot sender
+  now. See README-bridge-CL.md.
 - `start-sessions.sh` - idempotent boot/watchdog entrypoint (tmux
   sessions). Generates the persona file on first boot (see below).
 - `scripts/gen_agents.py` + `persona.tmpl.md` - generate the agent's

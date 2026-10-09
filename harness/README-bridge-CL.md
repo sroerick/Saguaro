@@ -24,8 +24,8 @@ xmpp stack instead of a second slixmpp implementation:
     sbcl --script harness/say.lisp muc ROOM_JID TEXT...    post to a configured room
     sbcl --script harness/say.lisp history ROOM_JID [MAX]  real room history (default 30)
 
-Same CLIs as the Python trio they replace (`dm_send.py` / `muc_send.py` /
-`muc_history.py`, scheduled for deletion after the zero-Python soak).
+Same CLIs as the Python trio they replaced (`dm_send.py` / `muc_send.py` /
+`muc_history.py`, retired 10-09 after the soak started green).
 Mechanics: say.lisp loads bridge.lisp as a library — `SAGUARO_NO_MAIN=1`
 goes up before the load so `(main)` never runs — binds a RANDOM per-shot
 resource (the live bridge holds the configured one; a second bind on it
