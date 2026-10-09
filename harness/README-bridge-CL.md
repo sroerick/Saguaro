@@ -36,6 +36,13 @@ join window. Rooms must be listed under `[bridge] mucs` — that list stays
 the authorization boundary. Exit 0 = stanza handed to the stream
 (delivery not confirmed), 1 = failure.
 
+Zero-Python soak (started 10-09): the recurring Python senders ride this
+stack too — heartbeat.py's owner push and canary.py's deliver hop call
+`say.lisp dm` / `say.lisp muc` instead of their own slixmpp clients.
+slixmpp now remains only in bridge.py (the BRIDGE_ENGINE=python
+fallback). The canary itself stays disarmed ([bridge] canary = "off")
+pending roerick.
+
 ## Why it exists (the three silent-turn bugs)
 
 1. **Time-based wait.** bridge.py gave up at `turn_timeout_secs` (900s); real

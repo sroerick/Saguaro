@@ -7,20 +7,18 @@ Cron (user al) runs this hourly. Flow:
   3. Wait (bounded) for the turn to finish.
   4. Extract the agent's reply with the same parser as bridge.py.
   5. If the reply is non-trivial (not the "nothing to report" sentinel),
-     push it to the owner over XMPP via a one-shot slixmpp client.
+   push it to the owner over XMPP via say.lisp (the bridge's own xmpp stack).
 
 So the agent can act proactively, but the owner only hears from it when
 there is something worth hearing. Log: heartbeat.log
 """
-import asyncio
+import subprocess
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bridge  # config (A, B) + parsers (status_records, all_records, reply_text)
-
-import slixmpp
 
 A, B = bridge.A, bridge.B
 
@@ -41,40 +39,19 @@ def agent_idle(session):
     return bool(cur and cur["idle"] and not cur["active"])
 
 
-class Push(slixmpp.ClientXMPP):
-    """One-shot client: connect, send, disconnect."""
-
-    def __init__(self, to, body):
-        pw = Path(B["password_file"]).read_text().strip()
-        super().__init__(B["jid"], pw)
-        self.to, self.body = to, body
-        self.add_event_handler("session_start", self.on_start)
-        self.add_event_handler("failed_auth", lambda e: self.loop.stop())
-        # no connection_failed handler: the server sometimes answers the
-        # FIRST TLS handshake with a protocol-version alert and slixmpp's
-        # connect loop retries successfully ~1s later; bailing out here
-        # used to drop the push on a healthy path. The push() timeout is
-        # the real bound.
-
-    async def on_start(self, e):
-        self.send_presence()
-        for chunk in bridge.chunk_text("[heartbeat] " + self.body):
-            self.send_message(mto=self.to, mbody=chunk, mtype="chat")
-            await asyncio.sleep(0.4)
-        await asyncio.sleep(1.0)  # let the stanza flush
-        self.disconnect()
-        self.loop.stop()
-
-
 def push(to, body, timeout=60):
-    # slixmpp schedules connect() on its own event loop; run THAT loop
-    # (same pattern as bridge.py), not a fresh one.
-    p = Push(to, body)
-    p.connect()
-    p.loop.call_later(timeout, p.loop.stop)
-    p.loop.run_forever()
-    p.loop.close()
-
+    """One-shot DM via the bridge's own xmpp stack (say.lisp). Replaces the
+    slixmpp Push client: one sbcl process per chunk, same delivery
+    semantics (exit 0 = stanza handed to the stream, delivery not
+    confirmed). Fails loudly on a nonzero say.lisp exit."""
+    say = Path(__file__).resolve().parent / "say.lisp"
+    for chunk in bridge.chunk_text("[heartbeat] " + body):
+        proc = subprocess.run(
+            ["/usr/local/bin/sbcl", "--script", str(say), "dm", to, chunk],
+            capture_output=True, text=True, timeout=timeout)
+        if proc.returncode != 0:
+            raise RuntimeError("say.lisp dm failed (rc=%d): %s %s" % (
+                proc.returncode, proc.stdout.strip(), proc.stderr.strip()))
 
 def main():
     rec = bridge.pick_session()
