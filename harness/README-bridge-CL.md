@@ -15,6 +15,27 @@ External contracts are unchanged, so `watchdog.py` / `canary.py` /
 `harness/bridge.log`, config `harness/config.toml`, turn marker
 `~/.cache/saguaro-turn-active`.
 
+## Senders (say.lisp, 2026-10-09)
+
+One-shot dm/muc/history tools for the agent's hands, reusing this file's
+xmpp stack instead of a second slixmpp implementation:
+
+    sbcl --script harness/say.lisp dm TO_JID BODY|-        one-shot DM ('-' body on stdin)
+    sbcl --script harness/say.lisp muc ROOM_JID TEXT...    post to a configured room
+    sbcl --script harness/say.lisp history ROOM_JID [MAX]  real room history (default 30)
+
+Same CLIs as the Python trio they replace (`dm_send.py` / `muc_send.py` /
+`muc_history.py`, scheduled for deletion after the zero-Python soak).
+Mechanics: say.lisp loads bridge.lisp as a library — `SAGUARO_NO_MAIN=1`
+goes up before the load so `(main)` never runs — binds a RANDOM per-shot
+resource (the live bridge holds the configured one; a second bind on it
+would kick the bridge off the server), sends, and closes. Room joins wait
+for real self-presence (status 110, nickname conflict retried as
+`nick-say`); history is the delay-stamped replay collected during the
+join window. Rooms must be listed under `[bridge] mucs` — that list stays
+the authorization boundary. Exit 0 = stanza handed to the stream
+(delivery not confirmed), 1 = failure.
+
 ## Why it exists (the three silent-turn bugs)
 
 1. **Time-based wait.** bridge.py gave up at `turn_timeout_secs` (900s); real
