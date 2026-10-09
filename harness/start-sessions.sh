@@ -109,12 +109,20 @@ if [ "$BRIDGE_ENGINE" = "python" ]; then
   BRIDGE_PAT="saguaro-live/harness/bridge.py"
 else
   # bridge.lisp writes bridge.log itself (log-line) AND echoes to stdout for
-  # the tmux pane, so DO NOT tee here: that would double every line.
-  BRIDGE_CMD="sbcl --script $DIR/bridge.lisp"
+  # the tmux pane, so DO NOT tee here: that would double every line. stderr
+  # goes to bridge.err: SBCL's unhandled-error backtrace otherwise lands only
+  # on the tmux pane, which dies with the session, so a bridge death left no
+  # evidence at all (2026-10-09). stdout stays on the pane + bridge.log.
+  [ -f "$DIR/bridge.err" ] && [ "$(wc -c < "$DIR/bridge.err")" -gt 1048576 ] \
+    && mv -f "$DIR/bridge.err" "$DIR/bridge.err.1"
+  BRIDGE_CMD="sbcl --script $DIR/bridge.lisp 2>>$DIR/bridge.err"
   BRIDGE_PAT="sbcl --script $DIR/bridge.lisp"
 fi
 
 if ! session_up xmpp-bridge "$BRIDGE_PAT"; then
   tmux kill-session -t xmpp-bridge 2>/dev/null || true
   tmux new-session -d -s xmpp-bridge "$BRIDGE_CMD"
+  # keep the pane (and its final output) after the command exits, so a crash
+  # can be read post-mortem instead of vanishing with the session
+  tmux set-option -t xmpp-bridge remain-on-exit on 2>/dev/null || true
 fi

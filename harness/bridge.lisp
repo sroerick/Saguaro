@@ -1933,16 +1933,23 @@ in-memory-only queue (lost DM observed 2026-10-09 ~06:50)."
   (baseline-watermarks)
   (let ((backoff 5))
     (loop
-      ;; connect (or reconnect after any fatal error below)
+      ;; connect (or reconnect after any fatal error below). The reconnect
+      ;; block matters: a failed CONNECT must skip the serve loop and RETRY.
+      ;; The old `(return)` here returned from the whole loop -- and so ended
+      ;; main and the process -- after a single failed connect, contradicting
+      ;; its own "retry in ~ds" line. It also only caught `error`; broaden to
+      ;; serious-condition (stack/heap exhaustion is a storage-condition, NOT
+      ;; an error) so a bad parse cannot abort the process.
+      (block reconnect
       (handler-case (progn (xmpp-connect) (setf backoff 5)
                            (reap-orphan))
-        (error (e)
+        (serious-condition (e)
             (log-line "connect failed: ~a — retry in ~ds" e backoff)
             (kill-transport)
             (setf *conn* nil)
             (sleep backoff)
             (setf backoff (min (* 2 backoff) 60))
-            (return)))
+            (return-from reconnect nil)))
       ;; serve until the stream dies
       (handler-case
           (progn
@@ -2009,12 +2016,12 @@ in-memory-only queue (lost DM observed 2026-10-09 ~06:50)."
                 (when (> (- (now) *main-last-flush*) 30)
                   (setf *main-last-flush* (now))
                   (flush-parked)))))
-        (error (e)
+        (serious-condition (e)
           (log-line "main loop error: ~a — reconnecting in ~ds" e backoff)
             (kill-transport)
             (setf *conn* nil)
           (sleep backoff)
-          (setf backoff (min (* 2 backoff) 60)))))))
+          (setf backoff (min (* 2 backoff) 60))))))))
 
 (defun xmpp-next-stanza-with-timeout ()
   "One complete stanza, or nil when nothing is fully available yet.
@@ -2230,5 +2237,23 @@ instead of returning nil, which would have spun silently forever.)"
       (dolist (child (child-dirs dir))
         (announce-task child)))))
 
+(defun fatal-exit (e)
+  "Log WHY the bridge is dying, with a backtrace, to stderr (-> bridge.err)
+ and to bridge.log, then exit non-zero so the supervisor restarts us. Without
+ this an aborted `sbcl --script` printed its backtrace only to the tmux pane,
+ which is destroyed with the session -- every death was unexplained (2026-10-09)."
+  (ignore-errors
+    (format *error-output* "~&FATAL ~a: ~a~%" (timestamp-string) e))
+  (ignore-errors
+    (let ((bt (find-symbol "PRINT-BACKTRACE" "SB-DEBUG")))
+      (when bt (funcall bt :stream *error-output* :count 60))))
+  (ignore-errors (finish-output *error-output*))
+  (ignore-errors (log-line "FATAL: ~a" e))
+  (sb-ext:exit :code 1))
+
 (unless (getenv* "SAGUARO_NO_MAIN")
-  (main))
+  (handler-case (main)
+    (serious-condition (e) (fatal-exit e)))
+  ;; main should never return; if it does, say so instead of dying silently
+  (log-line "FATAL: main returned without error")
+  (sb-ext:exit :code 1))

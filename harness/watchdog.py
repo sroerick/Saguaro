@@ -164,6 +164,30 @@ def bridge_spinning():
     return False  # healthy: stay silent
 
 
+def capture_crash(tag):
+    """Preserve WHY the bridge died: the tmux pane (SBCL's unhandled-error
+    backtrace / exit message, kept alive by remain-on-exit) plus the tail of
+    bridge.err, into a timestamped crash-<ts>.log beside the harness. Never
+    raises - a failed capture must not break the repair."""
+    try:
+        here = Path(__file__).resolve().parent
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        out = ["=== crash %s (%s) ===" % (stamp, tag)]
+        cap = sh(["/usr/bin/tmux", "capture-pane", "-p", "-S", "-300",
+                  "-t", "xmpp-bridge"], timeout=20)
+        out.append("--- tmux pane (tail) ---")
+        out.append(cap.stdout or "(no pane output / session gone)")
+        err = here / "bridge.err"
+        if err.exists():
+            lines = err.read_text(errors="replace").splitlines()[-200:]
+            out.append("--- bridge.err (tail) ---")
+            out.extend(lines or ["(empty)"])
+        (here / ("crash-%s.log" % stamp)).write_text("\n".join(out) + "\n")
+        print("watchdog: crash captured to crash-%s.log" % stamp, flush=True)
+    except Exception as e:
+        print("watchdog: crash capture failed: %s" % e, flush=True)
+
+
 def bridge_restart_recent():
     try:
         return (time.time() - BRIDGE_RESTART_MARK.stat().st_mtime) < BRIDGE_RESTART_MIN_GAP
@@ -173,6 +197,7 @@ def bridge_restart_recent():
 
 def restart_bridge(reason):
     print("watchdog: %s -> restarting xmpp-bridge" % reason, flush=True)
+    capture_crash(reason)
     sh(["/usr/bin/tmux", "kill-session", "-t", "xmpp-bridge"], timeout=30)
     time.sleep(2)
     sh(["/bin/sh", START], timeout=120)
@@ -238,6 +263,8 @@ def log_stale(rec):
 
 def recover_and_alert(reason):
     print("watchdog: %s -> restarting" % reason, flush=True)
+    if "bridge" in reason:
+        capture_crash(reason)
     sh(["/bin/sh", START], timeout=120)
     time.sleep(30)
     back = []
