@@ -20,6 +20,7 @@ one message into the canary room. Alerts the owner on failure.
 
 Silent exit when everything is healthy.
 """
+import re
 import subprocess
 import sys
 import time
@@ -199,7 +200,153 @@ def capture_crash(tag):
         print("watchdog: crash capture failed: %s" % e, flush=True)
 
 
-def check_no_text_turn():
+# --- proactive compaction guard (added 2026-10-10) ------------------------
+# A standing conversation on a reasoning model that cannot summarize itself
+# aborts turns once it is large: autolith runs a mid-turn compaction, the
+# summarization call comes back with no visible assistant text, and
+# PROVIDER-PROTOCOL-ERROR "Compaction produced no summary text." aborts the
+# turn BEFORE any record is written (0 assistant texts -> the bridge delivers
+# "(no text output)"). Four occurrences on 2026-10-09/10 at ~163-171K on the
+# 272K meter, model opencode/glm-5.3-flash. The manual recovery is a forced
+# `(compact)`; glm does it reliably while the conversation is small and
+# kimi-k3 does it at any size. So we compact PROACTIVELY, well below the
+# failure zone, borrowing kimi only if the pinned model cannot.
+COMPACT_AT_K = 120          # pane meter (K) at/above which we compact
+COMPACT_DONE_K = 40         # a compaction "worked" once the meter is below this
+COMPACT_MARK = Path.home() / ".cache" / "saguaro-compact-guard"
+COMPACT_MIN_GAP = 900       # at most one guard cycle per 15 min
+FALLBACK_MODEL = "opencode/kimi-k3"
+PICKER_HINT = "pick the reasoning effort"
+
+
+def _status_raw():
+    return sh([A["bin"], "localgroup", "status", "--sexp"], timeout=30).stdout
+
+
+def _status_field(raw, name):
+    m = re.search(r":%s\s+\"?([^\s\")]+)" % re.escape(name), raw)
+    return m.group(1) if m else None
+
+
+def _pane():
+    return sh(["/usr/bin/tmux", "capture-pane", "-p", "-t", "alagent"],
+              timeout=20).stdout
+
+
+def agent_ctx_k():
+    """Context meter reading from the agent pane, in K (e.g. 171)."""
+    m = re.search(r"ctx \[[^\]]*\]\s*(\d+)\s*K?\s*/", _pane())
+    return int(m.group(1)) if m else None
+
+
+def _wait_idle(timeout=40):
+    end = time.time() + timeout
+    while time.time() < end:
+        if _status_field(_status_raw(), "STATE") == ":IDLE":
+            return True
+        time.sleep(4)
+    return False
+
+
+def _wait_ctx_below(target_k, timeout):
+    end = time.time() + timeout
+    while time.time() < end:
+        k = agent_ctx_k()
+        if k is not None and k <= target_k:
+            return True
+        time.sleep(5)
+    return False
+
+
+def _set_model(model, session):
+    """Switch model via the agent and answer the reasoning-effort picker."""
+    sh([A["bin"], "localgroup", "tell", session, "/model %s" % model],
+       timeout=30)
+    for _ in range(4):
+        time.sleep(3)
+        if PICKER_HINT in _pane():
+            sh(["/usr/bin/tmux", "send-keys", "-t", "alagent", "Enter"],
+               timeout=20)
+        elif _status_field(_status_raw(), "STATE") == ":IDLE":
+            break
+    _wait_idle(30)
+
+
+def _do_compact(session):
+    """Tell the agent to compact and wait for the context meter to drop.
+
+    The guard only ever calls this with the meter at/above COMPACT_AT_K, and the
+    meter holds its value until the compaction finishes (it does not flash to 0
+    mid-flight), so 'meter now below COMPACT_DONE_K' is a faithful success test.
+    On failure/timeout, abort any wedged operation with C-c and let the caller
+    escalate."""
+    sh([A["bin"], "localgroup", "tell", session, "(compact)"], timeout=30)
+    if _wait_ctx_below(COMPACT_DONE_K, 240):
+        return True
+    sh(["/usr/bin/tmux", "send-keys", "-t", "alagent", "C-c"], timeout=20)
+    time.sleep(3)
+    return False
+
+
+def rescue_compact(session):
+    """Free the standing conversation: force a compaction, borrowing kimi-k3
+    (which can summarize any size) only if the pinned model cannot."""
+    if not session or not _wait_idle(30):
+        print("watchdog: rescue_compact: session not idle; skipping",
+              flush=True)
+        return False
+    model = _status_field(_status_raw(), "MODEL")
+    ok = _do_compact(session)
+    if not ok:
+        print("watchdog: rescue_compact: %s could not compact; trying %s"
+              % (model, FALLBACK_MODEL), flush=True)
+        _set_model(FALLBACK_MODEL, session)
+        ok = _do_compact(session)
+        if model and model != FALLBACK_MODEL:
+            _set_model(model, session)
+    print("watchdog: rescue_compact: %s (model %s)"
+          % ("compacted" if ok else "FAILED", model), flush=True)
+    return ok
+
+
+def compact_guard_recent():
+    try:
+        return (time.time() - COMPACT_MARK.stat().st_mtime) < COMPACT_MIN_GAP
+    except OSError:
+        return False
+
+
+def check_compact_guard(rec):
+    """Proactively compact before the conversation reaches the size at which
+    the model can no longer summarize it. Returns True if it compacted."""
+    if compact_guard_recent():
+        return False
+    if rec.get("active") or not rec.get("idle"):
+        return False
+    k = agent_ctx_k()
+    if k is None or k < COMPACT_AT_K:
+        return False
+    print("watchdog: context at %dK (>= %dK) - proactively compacting"
+          % (k, COMPACT_AT_K), flush=True)
+    try:
+        COMPACT_MARK.parent.mkdir(parents=True, exist_ok=True)
+        COMPACT_MARK.touch()
+    except OSError:
+        pass
+    ok = rescue_compact(rec.get("session"))
+    if not ok:
+        try:
+            push(B["allow"][0],
+                 "watchdog: the agent's conversation reached %dK tokens and "
+                 "could NOT be auto-compacted (the compaction bug). It needs "
+                 "manual eyes - rotate the standing conversation or force a "
+                 "compaction under another model." % k)
+        except Exception as e:
+            print("watchdog: push failed: %s" % e, flush=True)
+    return ok
+
+
+def check_no_text_turn(rec, auto_fixed=False):
     """Page the owner when the bridge reports a turn with no assistant text."""
     try:
         age = time.time() - NO_TEXT_MARK.stat().st_mtime
@@ -216,14 +363,24 @@ def check_no_text_turn():
         NO_TEXT_ALERTED.touch()
     except OSError:
         pass
+    if not auto_fixed and rec:
+        k = agent_ctx_k()
+        if k is not None and k >= COMPACT_AT_K:
+            auto_fixed = rescue_compact(rec.get("session"))
+    if auto_fixed:
+        msg = ("the agent's last turn produced NO assistant text (%.0f min "
+               "ago) - the known compaction failure at large context. I "
+               "auto-compacted the conversation, so it is responsive again: "
+               "just re-ask." % (age / 60.0))
+    else:
+        msg = ("the agent's last turn produced NO assistant text (%.0f min "
+               "ago) - usually a compaction failure at large context "
+               "(autolith: \"Compaction produced no summary text.\"), which "
+               "aborts the turn before it writes anything, so the reply was "
+               "lost. Re-ask. If it repeats, the standing conversation needs "
+               "a forced compaction re-run or a rotation." % (age / 60.0))
     try:
-        push(B["allow"][0],
-             "the agent's last turn produced NO assistant text (%.0f min ago)"
-             " - usually a compaction failure at large context (autolith: "
-             "\"Compaction produced no summary text.\"), which aborts the turn "
-             "before it writes anything, so the reply was lost. Re-ask. If it "
-             "repeats, the standing conversation needs a forced compaction "
-             "re-run (localgroup tell) or a rotation." % (age / 60.0))
+        push(B["allow"][0], msg)
     except Exception as e:
         print("watchdog: push failed: %s" % e, flush=True)
 
@@ -371,7 +528,10 @@ def main():
             print("watchdog: push failed: %s" % e, flush=True)
         return
 
-    check_no_text_turn()
+    # Proactively keep the conversation below the size at which the model can
+    # no longer summarize it; then page about any 0-text turn (auto-fixed or not).
+    compacted = check_compact_guard(rec)
+    check_no_text_turn(rec, compacted)
 
     if canary_due():
         try:
