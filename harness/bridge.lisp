@@ -772,10 +772,23 @@ parks the text so it is retried later, never dropped."
                  (log-line "WARNING: dropping ~d bytes of unparseable conversation data in ~a"
                            (length rest) key)
                  (setf rest ""))
-               (let ((all (append records forms)))
+               (let* ((all (append records forms))
+                      ;; Prune records we have already consumed (seq <= the
+                      ;; persisted per-file watermark) so the cache holds only
+                      ;; UNCONSUMED records. Without this, the cache retained
+                      ;; every parsed form of the growing conversation (49 MB
+                      ;; -> ~188 MB live) and, doubled during a full re-parse,
+                      ;; exhausted the SBCL heap (2026-10-11). Bounded now.
+                      (wm (watermark-for path))
+                      (kept (if (plusp wm)
+                                (remove-if (lambda (r)
+                                             (let ((s (record-seq r)))
+                                               (and s (<= s wm))))
+                                           all)
+                                all)))
                  (setf (gethash key *file-cache*)
-                       (list (+ read-upto (length chunk)) rest all))
-                 all)))))))
+                       (list (+ read-upto (length chunk)) rest kept))
+                 kept)))))))
 
 (defun parse-forms-incremental (buf)
   "Read as many complete top-level forms as possible from BUF.
@@ -837,14 +850,16 @@ parks the text so it is retried later, never dropped."
                       (sleep *al-poll-secs*))))))
 
 (defun rescan-conversation ()
-  "Drop the incremental parse cache so the next records-for-file re-reads
-   from disk. Called at turn end: the cache is keyed on bytes read, and a
-   turn's final records can land after the last poll, so the answer was
-   occasionally collected as 0 records while the reply sat in the file
-   (observed 2026-09-27 on a pp-dm turn). A full re-parse of the 20MB
-   standing conversation costs ~0.6s — cheap insurance."
-  (dolist (p (conv-files))
-    (remhash (namestring p) *file-cache*)))
+  "Retained for compatibility; now a NO-OP.
+
+   It used to DROP the whole parse cache at turn end so the next
+   records-for-file re-read from disk (late-arriving records). That forced a
+   full re-parse of the conversation every turn AND made the cache retain every
+   parsed form - the memory blow-up that exhausted the SBCL heap (2026-10-11).
+   The incremental cache now persists across turns and holds only unconsumed
+   records (records-for-file prunes by watermark), so late records are still
+   seen: each retry round reads only the bytes written since the last read."
+  nil)
 
 (defun advance-watermarks (new-records)
   (dolist (item new-records)
