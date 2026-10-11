@@ -850,16 +850,17 @@ parks the text so it is retried later, never dropped."
                       (sleep *al-poll-secs*))))))
 
 (defun rescan-conversation ()
-  "Retained for compatibility; now a NO-OP.
-
-   It used to DROP the whole parse cache at turn end so the next
-   records-for-file re-read from disk (late-arriving records). That forced a
-   full re-parse of the conversation every turn AND made the cache retain every
-   parsed form - the memory blow-up that exhausted the SBCL heap (2026-10-11).
-   The incremental cache now persists across turns and holds only unconsumed
-   records (records-for-file prunes by watermark), so late records are still
-   seen: each retry round reads only the bytes written since the last read."
-  nil)
+  "Drop the incremental parse cache so the next records-for-file re-reads
+   from disk. Called at turn end: the cache is keyed on bytes read, and a
+   turn's final records can land after the last poll, so the answer was
+   occasionally collected as 0 records while the reply sat in the file
+   (observed 2026-09-27 on a pp-dm turn). Kept: making this a no-op regressed
+   collection (a live round trip collected 0 records, 2026-10-11), because a
+   turn's records can land in a file the incremental cache has already read
+   past. Memory is bounded instead by records-for-file PRUNING consumed
+   records, so the cache never retains the whole conversation."
+  (dolist (p (conv-files))
+    (remhash (namestring p) *file-cache*)))
 
 (defun advance-watermarks (new-records)
   (dolist (item new-records)
