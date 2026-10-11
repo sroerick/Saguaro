@@ -50,20 +50,29 @@
 # already past the ceiling, and the compaction upload itself 400s, so
 # compaction can never recover the conversation. At 60 the trigger is 163.2K
   # reported ~= 390K real, i.e. ~134K (26%) headroom.
-  # 2026-10-11 true window set: AUTOLITH_CONTEXT_WINDOW=524288 + threshold
-  # 60 -> 38. Compaction now borrows kimi-k3 in-image (compact-model.lisp),
-  # so the compaction-upload ceiling is gone; the only hard death left is a
-  # REGULAR call exceeding the TRUE 524,288 ceiling while the meter
-  # undercounts it (~2.1x on 9/24, ~2.4x on 9/30). The extended context-window
-  # setting is derived and re-reads AUTOLITH_CONTEXT_WINDOW on every access;
-  # the compaction trigger is window*thr on REPORTED totals. At 38 on the
-  # true window: trigger = floor(524288*0.38) = 199,229 reported ~= 478K
-  # real at 2.4x (~91% of ceiling), +22% usable context vs the old 163.2K
-  # trigger at 272K@60. Death now needs an undercount ratio > 2.63 vs the
-  # 2.4 measured max (~10% drift margin). Applied live 10-11 without a
-  # restart (runtime env setf + configuration-set; reported
-  # 524288/38/199229) and here for restarts. The watchdog proactive guard
-  # stays retired (COMPACT_RESCUE_ENABLED=False), so the in-image trigger
+  # 2026-10-11 (revised same day): AUTOLITH_CONTEXT_WINDOW=524288 + threshold 80.
+  # The "meter undercounts ~2.1-2.4x" story line 43+ is RETIRED. glm's own usage
+  # series in E-5WjMcb is self-consistent turn to turn (65,703 -> 71,391 -> 83,688
+  # prompt tokens, deltas matching turn growth, cached tokens itemized), so its
+  # usage report ~= its own validation count; if glm really validated at ~2.2x its
+  # reports, EVERYTHING would have 400ed long before the wall - it didn't. The
+  # 550,034/526,664 rejections are better explained by (a) the OLD compaction path
+  # re-uploading the full history: 0.62.1's agent-compact-conversation docstring
+  # says the native-checkpoint integration exists to avoid "a second upload of the
+  # full pre-compaction history" - 246K prompt re-uploaded whole is exactly the
+  # 550K glm rejected; and (b) cross-model metering: the trigger reads the NEWEST
+  # usage record (store.lisp conversation-append-provider-metadata + :provider
+  # record projection both overwrite conversation-last-total-tokens), and in the
+  # manual /model hop era that newest record was often KIMI-reported, whose counts
+  # (e.g. 2,289,191 input in one kimi record here) are not comparable to glm's.
+  # With compaction now kimi's job (in-image borrow, compact-model.lisp), glm
+  # never issues compaction requests, so the trigger only sets WHEN to compact:
+  # 80% of the true window = floor(524288*0.80) = 419,430 reported, ~105K margin
+  # under glm's own validation wall. Caveat: until the next glm response, the
+  # meter may be kimi-stamped (one small extra compaction possible, self-
+  # correcting). Applied live in-image 10-11 (env setf + configuration-set;
+  # verified 524288/80/419430) and here for restarts. The watchdog proactive
+  # guard stays retired (COMPACT_RESCUE_ENABLED=False) - the in-image trigger
   # governs.
 DIR="${OPENCLIWSP_DIR:-$(cd "$(dirname "$0")" && pwd)}"
 CFG="${BRIDGE_CONFIG:-$DIR/config.toml}"
@@ -110,7 +119,7 @@ session_up() {   # $1 = tmux session name   $2 = pgrep pattern for its process
 if ! session_up alagent "autolith"; then
   tmux kill-session -t alagent 2>/dev/null || true
   tmux new-session -d -s alagent \
-    "CL_EXEC_SANDBOX_PROCESS_GROUP_HELPER=$SB_HELPER AUTOLITH_COMPACTION_THRESHOLD=38 AUTOLITH_CONTEXT_WINDOW=524288 $AL $RESUME --permissions full 2>&1"
+    "CL_EXEC_SANDBOX_PROCESS_GROUP_HELPER=$SB_HELPER AUTOLITH_COMPACTION_THRESHOLD=80 AUTOLITH_CONTEXT_WINDOW=524288 $AL $RESUME --permissions full 2>&1"
 fi
 
 # Bridge engine (2026-09-27): the Common Lisp bridge is the default; set
