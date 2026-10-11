@@ -115,8 +115,13 @@ else
   # evidence at all (2026-10-09). stdout stays on the pane + bridge.log.
   [ -f "$DIR/bridge.err" ] && [ "$(wc -c < "$DIR/bridge.err")" -gt 1048576 ] \
     && mv -f "$DIR/bridge.err" "$DIR/bridge.err.1"
-  BRIDGE_CMD="sbcl --script $DIR/bridge.lisp 2>>$DIR/bridge.err"
-  BRIDGE_PAT="sbcl --script $DIR/bridge.lisp"
+  # 2026-10-11: raised the bridge heap (default ~768M exhausted parsing the
+  # grown conversation -> "Heap exhausted, game over" at 03:38). 1200M is the
+  # most that fits: al's login-class datasize cap is 1536M (login.conf), and
+  # >=1408M fails to allocate at startup. For more, raise al's datasize limit.
+  # Keep BRIDGE_PAT in sync with the flags.
+  BRIDGE_CMD="sbcl --dynamic-space-size 1200 --script $DIR/bridge.lisp 2>>$DIR/bridge.err"
+  BRIDGE_PAT="bridge.lisp"
 fi
 
 if ! session_up xmpp-bridge "$BRIDGE_PAT"; then
