@@ -49,7 +49,22 @@
 # ~2.4 = 526K real. At 80 the trigger (217.6K reported) maps to ~521K real:
 # already past the ceiling, and the compaction upload itself 400s, so
 # compaction can never recover the conversation. At 60 the trigger is 163.2K
-# reported ~= 390K real, i.e. ~134K (26%) headroom.
+  # reported ~= 390K real, i.e. ~134K (26%) headroom.
+  # 2026-10-11 true window set: AUTOLITH_CONTEXT_WINDOW=524288 + threshold
+  # 60 -> 38. Compaction now borrows kimi-k3 in-image (compact-model.lisp),
+  # so the compaction-upload ceiling is gone; the only hard death left is a
+  # REGULAR call exceeding the TRUE 524,288 ceiling while the meter
+  # undercounts it (~2.1x on 9/24, ~2.4x on 9/30). The extended context-window
+  # setting is derived and re-reads AUTOLITH_CONTEXT_WINDOW on every access;
+  # the compaction trigger is window*thr on REPORTED totals. At 38 on the
+  # true window: trigger = floor(524288*0.38) = 199,229 reported ~= 478K
+  # real at 2.4x (~91% of ceiling), +22% usable context vs the old 163.2K
+  # trigger at 272K@60. Death now needs an undercount ratio > 2.63 vs the
+  # 2.4 measured max (~10% drift margin). Applied live 10-11 without a
+  # restart (runtime env setf + configuration-set; reported
+  # 524288/38/199229) and here for restarts. The watchdog proactive guard
+  # stays retired (COMPACT_RESCUE_ENABLED=False), so the in-image trigger
+  # governs.
 DIR="${OPENCLIWSP_DIR:-$(cd "$(dirname "$0")" && pwd)}"
 CFG="${BRIDGE_CONFIG:-$DIR/config.toml}"
 export BRIDGE_CONFIG="$CFG"
@@ -95,7 +110,7 @@ session_up() {   # $1 = tmux session name   $2 = pgrep pattern for its process
 if ! session_up alagent "autolith"; then
   tmux kill-session -t alagent 2>/dev/null || true
   tmux new-session -d -s alagent \
-    "CL_EXEC_SANDBOX_PROCESS_GROUP_HELPER=$SB_HELPER AUTOLITH_COMPACTION_THRESHOLD=60 $AL $RESUME --permissions full 2>&1"
+    "CL_EXEC_SANDBOX_PROCESS_GROUP_HELPER=$SB_HELPER AUTOLITH_COMPACTION_THRESHOLD=38 AUTOLITH_CONTEXT_WINDOW=524288 $AL $RESUME --permissions full 2>&1"
 fi
 
 # Bridge engine (2026-09-27): the Common Lisp bridge is the default; set
