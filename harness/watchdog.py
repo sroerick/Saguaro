@@ -212,6 +212,12 @@ def capture_crash(tag):
 # kimi-k3 does it at any size. So we compact PROACTIVELY, well below the
 # failure zone, borrowing kimi only if the pinned model cannot.
 COMPACT_AT_K = 120          # pane meter (K) at/above which we compact
+# 2026-10-11: compaction is handled INSIDE the image now (compact-model.lisp
+# borrows kimi for the compaction and restores the pinned provider). The
+# external model-switching rescue below is RETIRED by default: it hand-switched
+# models and its failure path sent C-c, which kills the whole app on autolith
+# 0.62.1. Set this True only if the in-image swap is removed or broken.
+COMPACT_RESCUE_ENABLED = False
 COMPACT_DONE_K = 40         # a compaction "worked" once the meter is below this
 COMPACT_MARK = Path.home() / ".cache" / "saguaro-compact-guard"
 COMPACT_MIN_GAP = 900       # at most one guard cycle per 15 min
@@ -319,6 +325,8 @@ def compact_guard_recent():
 def check_compact_guard(rec):
     """Proactively compact before the conversation reaches the size at which
     the model can no longer summarize it. Returns True if it compacted."""
+    if not COMPACT_RESCUE_ENABLED:
+        return False
     if compact_guard_recent():
         return False
     if rec.get("active") or not rec.get("idle"):
@@ -363,7 +371,7 @@ def check_no_text_turn(rec, auto_fixed=False):
         NO_TEXT_ALERTED.touch()
     except OSError:
         pass
-    if not auto_fixed and rec:
+    if not auto_fixed and rec and COMPACT_RESCUE_ENABLED:
         k = agent_ctx_k()
         if k is not None and k >= COMPACT_AT_K:
             auto_fixed = rescue_compact(rec.get("session"))
@@ -374,11 +382,12 @@ def check_no_text_turn(rec, auto_fixed=False):
                "just re-ask." % (age / 60.0))
     else:
         msg = ("the agent's last turn produced NO assistant text (%.0f min "
-               "ago) - usually a compaction failure at large context "
-               "(autolith: \"Compaction produced no summary text.\"), which "
-               "aborts the turn before it writes anything, so the reply was "
-               "lost. Re-ask. If it repeats, the standing conversation needs "
-               "a forced compaction re-run or a rotation." % (age / 60.0))
+               "ago) - a compaction failure at large context (autolith: "
+               "\"Compaction produced no summary text.\"), which aborts the "
+               "turn before it writes anything. Compaction is now borrowed to "
+               "kimi in-image; if this still happens, check "
+               "/home/al/.cache/compact-model-swap.log, then re-ask or rotate "
+               "the conversation." % (age / 60.0))
     try:
         push(B["allow"][0], msg)
     except Exception as e:
