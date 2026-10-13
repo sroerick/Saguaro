@@ -1,29 +1,37 @@
-;;; compact-model.lisp — run Autolith conversation compaction under a BORROWED
-;;; model (kimi-k3), then restore the session's own provider/model.
+;;; compact-model.lisp — FALLBACK compaction model.
 ;;;
-;;; Why: on this provider, glm-5.3-flash cannot summarize a large standing
-;;; conversation ("Compaction produced no summary text."), which aborts the
-;;; turn. kimi-k3 can. We want kimi ONLY for compaction, never as the pinned
-;;; model. A failed restore is expensive, so the swap is done on the agent's
-;;; runtime provider slot and ALWAYS undone via UNWIND-PROTECT. The
-;;; configuration/preferences are never touched, so nothing can drift to kimi.
+;;; Run Autolith conversation compaction under the PINNED model, and borrow a
+;;; different model ONLY if that compaction raises PROVIDER-PROTOCOL-ERROR.
 ;;;
-;;; Toggle off (e.g. after an upstream compaction fix): set
-;;;   *compaction-use-kimi* NIL before this file loads, or drop its (load ...)
-;;;   line from ~/.config/autolith/init.lisp.
+;;; History:
+;;;   2026-10-11 — this file UNCONDITIONALLY borrowed opencode/kimi-k3 for every
+;;;     compaction, to work around "Compaction produced no summary text." on
+;;;     opencode/glm-5.3-flash at large (~160K+) context. It worked, but paid
+;;;     kimi tokens on ~every compaction (~1 per 2h; 21 borrows in 41h).
+;;;   2026-10-12 — gregor was moved to the regular (non-flash) opencode/glm-5.3,
+;;;     which summarizes large contexts fine. The borrow is now a FALLBACK:
+;;;     try the pinned model first; only on a compaction failure retry ONCE
+;;;     under *compaction-borrowed-model*.
 ;;;
-;;; Pinned to autolith 0.62.1 internals:
-;;;   agent-compact-conversation, agent-provider, agent-configuration,
-;;;   provider-create, configuration-copy (:model).
-;;; Re-check these on every autolith upgrade.
+;;; Both providers are swapped on the agent's runtime provider slot and ALWAYS
+;;; restored (UNWIND-PROTECT); configuration and preferences are never touched,
+;;; so the pinned model cannot drift to the borrowed model.
+;;;
+;;; Toggle off: set *compaction-use-kimi* NIL before this loads, or drop the
+;;; (load ...) line from ~/.config/autolith/init.lisp.
+;;;
+;;; Pinned to autolith 0.62.1 internals: agent-compact-conversation,
+;;; agent-provider, agent-configuration, provider-create, configuration-copy
+;;; (:model), provider-protocol-error (cl-llm-provider-api, re-exported by
+;;; autolith). Re-check these on every autolith upgrade.
 
 (in-package :autolith)
 
 (defparameter *compaction-use-kimi* t
-  "When true, conversation compaction runs under *compaction-borrowed-model*.")
+  "When true, a failed compaction is retried under *compaction-borrowed-model*.")
 
 (defparameter *compaction-borrowed-model* "opencode/kimi-k3"
-  "Model used only for compaction summarization (never pinned).")
+  "Model used only to RETRY a failed compaction (never pinned).")
 
 (defparameter *compact-model-beacon*
   (merge-pathnames ".cache/compact-model-swap.log" (user-homedir-pathname))
@@ -43,6 +51,13 @@ DEFPARAMETER) so a replay/reload in the same image keeps it true.")
       (format s "~&~A ~A~%" (get-universal-time)
               (apply #'format nil fmt args)))))
 
+(defun %compact-model-borrow (agent)
+  "Point AGENT's runtime provider at the borrowed compaction model."
+  (setf (agent-provider agent)
+        (provider-create
+         (configuration-copy (agent-configuration agent)
+                             :model *compaction-borrowed-model*))))
+
 (defun %compact-model-install ()
   (when (and *compaction-use-kimi* (not *compact-model-wrapped-p*))
     (let ((original (fdefinition 'agent-compact-conversation)))
@@ -50,18 +65,23 @@ DEFPARAMETER) so a replay/reload in the same image keeps it true.")
             (lambda (agent observer &rest args)
               (let ((saved (agent-provider agent)))
                 (unwind-protect
-                     (progn
-                       (setf (agent-provider agent)
-                             (provider-create
-                              (configuration-copy (agent-configuration agent)
-                                                  :model *compaction-borrowed-model*)))
-                       (%compact-model-note "compaction: borrowing ~A"
-                                            *compaction-borrowed-model*)
-                       (apply original agent observer args))
-                  (setf (agent-provider agent) saved)
-                  (%compact-model-note "compaction: restored original provider")))))
+                     (handler-case
+                         ;; First attempt: whatever model is pinned right now.
+                         (apply original agent observer args)
+                       (provider-protocol-error (cause)
+                         ;; Compaction failed under the pinned model (typically
+                         ;; "Compaction produced no summary text."). Retry ONCE
+                         ;; under the borrowed model; if that fails too, its
+                         ;; condition propagates unchanged.
+                         (%compact-model-note
+                          "compaction failed under pinned model (~A); borrowing ~A"
+                          (type-of cause) *compaction-borrowed-model*)
+                         (%compact-model-borrow agent)
+                         (apply original agent observer args)))
+                  (setf (agent-provider agent) saved)))))
       (setf *compact-model-wrapped-p* t)
-      (%compact-model-note "compact-model installed: borrow ~A"
-                           *compaction-borrowed-model*))))
+      (%compact-model-note
+       "compact-model installed: FALLBACK mode (borrow ~A only on compaction failure)"
+       *compaction-borrowed-model*))))
 
 (%compact-model-install)
