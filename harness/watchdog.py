@@ -220,8 +220,11 @@ def incident(kind, note):
             lines = err.read_text(errors="replace").splitlines()[-200:]
             out.append("--- bridge.err (tail) ---")
             out.extend(lines or ["(empty)"])
-        out.append("--- agent status ---")
-        out.append(_status_raw() or "(status unavailable)")
+        try:
+            out.append("--- agent status ---")
+            out.append(_status_raw() or "(status unavailable)")
+        except Exception as e:
+            out.append("(status check failed: %s)" % e)
         d = here / "incidents"
         d.mkdir(exist_ok=True)
         f = d / ("%s-%s.log" % (stamp, kind))
