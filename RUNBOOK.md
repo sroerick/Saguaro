@@ -89,6 +89,15 @@ bundle per watchdog action, with pane + log evidence), `watchdog.log`
 breaker's raw restart log). Whatever a manual session fixes, fold back
 into the harness -- that is what makes the next session unnecessary.
 
+Chat commands (2026-10-16): a standalone `/...` DM from an allowlisted
+sender is answered by the bridge itself, with no agent turn -- so they
+work even when the provider is dead. `/ping`, `/status`, `/help` are
+read-only; owner ops `/restart`, `/compact`, `/canary`, `/pause <1-72h>`
+(`/pause off` lifts) trigger or gate the same actions the watchdog
+automates, with cooldowns. Unknown commands get a short local reply, and
+non-allowlisted senders never reach the command layer. Anything without
+a leading `/` goes to the agent as prose, exactly as before.
+
 ## 7. Optional: Pricklypear-backed memory (default: off)
 
 Out of the box, the agent's persistent memory is autolith's native local

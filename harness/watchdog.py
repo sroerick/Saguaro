@@ -79,6 +79,27 @@ BREAKER_WINDOW = 1800       # 30 min lookback
 BREAKER_TRIP = 3            # restarts within the window that trip it
 BREAKER_COOLDOWN = 2700     # 45 min hands-off after a trip
 
+# --- chat-command pause (added 2026-10-16) ----------------------------------
+# /pause <hours> from XMPP writes this marker; the watchdog skips ALL
+# repairs and pages while it is live (hermes' /pause: in-flight work
+# finishes, the operator can always act, so chat commands keep working
+# while paused).
+PAUSE_MARK = Path.home() / ".cache" / "saguaro-watchdog-paused"
+
+def watchdog_pause_left():
+    """Seconds left on an owner-set pause, or None."""
+    try:
+        exp = int(PAUSE_MARK.read_text().strip())
+    except (OSError, ValueError):
+        return None
+    left = exp - time.time()
+    return left if left > 0 else None
+
+def fmt_secs(secs):
+    if secs >= 3600:
+        return "%dh%02dm" % (secs // 3600, (secs % 3600) // 60)
+    return "%dm%02ds" % (secs // 60, secs % 60)
+
 # --- independent alert channel (added 2026-10-16) ---------------------------
 # The XMPP page rides the transport being repaired. Critical pages (and any
 # failed XMPP push) also go to ntfy - the channel public-audit already pages
@@ -610,6 +631,12 @@ def recover_and_alert(reason):
 
 
 def main():
+    pause_left = watchdog_pause_left()
+    if pause_left is not None:
+        print("watchdog: paused for %s - skipping cycle (chat commands still work)"
+              % fmt_secs(pause_left), flush=True)
+        return
+    recs = agent_status()
     recs = agent_status()
     if not recs:
         recover_and_alert("no autolith session answering")
