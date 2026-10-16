@@ -1643,6 +1643,219 @@ inside attribute values do not affect depth."
                          (xml-escape to) mtype (xml-escape part))))))
 
 ;;; ---------------------------------------------------------------------
+;;; chat commands (owner-only, standalone, bridge-local -- no agent turn)
+;;;
+;;; Modeled on openclaw's gateway commands and hermes' /start + /pause:
+;;; a standalone "/..." DM from an allowlisted sender is answered HERE,
+;;; from local state, with NO agent turn -- so /status still answers when
+;;; the provider is dead (the 36h K3CL8Cm outage: chat path up, agent
+;;; mute, no way to ask the box anything from a phone). Commands are
+;;; standalone messages only; anything not starting with "/" is prose and
+;;; goes to the agent exactly as before. Unknown commands get a short
+;;; local reply (never a turn, never a silent swallow). Non-allowlisted
+;;; senders never reach this code: stanza-allowed-p gates the DM path
+;;; upstream. No host shell over chat, no secret reads.
+;;; ---------------------------------------------------------------------
+
+(defparameter *bridge-started* (get-universal-time))
+(defparameter *pause-path* (home-path ".cache/saguaro-watchdog-paused"))
+
+(defun command-p (body)
+  "Standalone command: the entire body starts with '/'."
+  (and (plusp (length body)) (char= (char body 0) #\/)))
+
+(defun fmt-duration (secs)
+  "~2dh~2,'0dm above an hour, else ~dm~2,'0ds."
+  (if (>= secs 3600)
+      (format nil "~dh~2,'0dm" (floor secs 3600) (floor (mod secs 3600) 60))
+      (format nil "~dm~2,'0ds" (floor secs 60) (mod (floor secs 1) 60))))
+
+(defun cmd-cd-recent (name secs)
+  "True within SECS of the last marker touch; touches it otherwise.
+Cooldown so /restart //compact //canary spam cannot fight the watchdog."
+  (let* ((p (format nil "~a/.cache/saguaro-cmd-~a" *home* name))
+         (stamp (ignore-errors (file-write-date p))))
+    (if (and stamp (< (- (get-universal-time) stamp) secs))
+        t
+        (progn
+          (ignore-errors
+            (with-open-file (f p :direction :output
+                                :if-exists :supersede
+                                :if-does-not-exist :create)
+              (format f "~a~%" (timestamp-string))))
+          nil))))
+
+(defun cmd-sexp-field (raw name)
+  "The value after :NAME in a `localgroup status --sexp` blob -- quoted
+string or keyword, watchdog's regex in plain CL."
+  (let* ((pos (search (format nil ":~a" name) raw :test #'char-equal))
+         (i (and pos (position-if
+                      #'(lambda (c) (not (member c '(#\Space #\Tab))))
+                      raw :start (+ pos (length name) 1))))
+         (q (and i (char= (char raw i) #\")))
+         (end-str (and i q (position #\" raw :start (1+ i))))
+         (end-tok (and i (not q)
+                       (position-if #'(lambda (c)
+                                        (member c '(#\Space #\) #\Newline)))
+                                    raw :start i))))
+    (cond ((and i q) (and end-str (subseq raw (1+ i) end-str)))
+          (i (subseq raw i (or end-tok (length raw))))
+          (t nil))))
+
+(defun cmd-ctx-k ()
+  "Context meter (K) from the alagent pane, watchdog-style; NIL when absent."
+  (multiple-value-bind (out err code)
+      (run-capture (list "/usr/bin/tmux" "capture-pane" "-p" "-t" "alagent") 15)
+    (declare (ignore err))
+    (when (zerop code)
+      (let* ((hit (search "ctx [" out))
+             (close (and hit (position #\] out :start hit)))
+             (i (and close (position-if #'digit-char-p out :start (1+ close))))
+             (j (and i (or (position-if-not #'digit-char-p out :start i)
+                           (length out)))))
+        (and i j (parse-integer out :start i :end j :junk-allowed t))))))
+
+(defun cmd-status-raw ()
+  "Raw `localgroup status --sexp` output, or NIL."
+  (multiple-value-bind (out err code)
+      (run-capture (list *al-bin* "localgroup" "status" "--sexp") 15)
+    (declare (ignore err))
+    (and (zerop code) (plusp (length (trim out))) out)))
+
+(defun watchdog-pause-expiry ()
+  "Universal time when the watchdog pause ends, or NIL."
+  (let ((s (read-file-string *pause-path*)))
+    (when s
+      (let ((n (parse-integer (trim s) :junk-allowed t)))
+        (and n (> n (get-universal-time)) n)))))
+
+(defun pause-write (secs)
+  (ignore-errors
+    (with-open-file (f *pause-path* :direction :output
+                       :if-exists :supersede :if-does-not-exist :create)
+      (format f "~d~%" (+ (get-universal-time) secs)))))
+
+(defun cmd-ping ()
+  (format nil "pong - bridge alive ~a (agent is a separate process; /status for detail)"
+          (fmt-duration (- (get-universal-time) *bridge-started*))))
+
+(defun cmd-help ()
+  (format nil "bridge-local commands (no agent turn; work even when the model is down):~%
+  /ping /status /help~%
+  owner ops: /restart /compact /canary /pause <1-72h> | /pause off~%
+Anything without a leading / goes to the agent as prose."))
+
+(defun cmd-recent-incidents ()
+  (let* ((files (ignore-errors
+                  (directory (format nil "~aincidents/*.log" *harness-dir*))))
+         (sorted (and files
+                      (sort files #'> :key
+                            (lambda (f)
+                              (or (ignore-errors (file-write-date f)) 0))))))
+    (if sorted
+        (format nil "recent incidents: ~{~a~^, ~}"
+                (mapcar (lambda (f) (enough-namestring f *harness-dir*))
+                        (subseq sorted 0 (min 2 (length sorted)))))
+        "recent incidents: none")))
+
+(defun cmd-status ()
+  (let* ((raw (cmd-status-raw))
+         (agent (if raw
+                    (format nil "agent ~a [~a] ctx ~aK, session ~a"
+                            (or (cmd-sexp-field raw "STATE") "?")
+                            (or (cmd-sexp-field raw "MODEL") "?")
+                            (or (cmd-ctx-k) "?")
+                            (or (cmd-sexp-field raw "SESSION") *al-conv* "?"))
+                    "agent: status unavailable"))
+         (canary-age (let ((d (ignore-errors
+                               (file-write-date
+                                (home-path ".cache/saguaro-canary")))))
+                       (if d
+                           (fmt-duration (- (get-universal-time) d))
+                           "never")))
+         (pause (let ((e (watchdog-pause-expiry)))
+                  (if e
+                      (format nil "yes, ~a left"
+                              (fmt-duration (- e (get-universal-time))))
+                      "no"))))
+    (format nil "~a~%bridge up ~a, queue ~d, canary green ~a ago, watchdog paused: ~a~%~a"
+            agent
+            (fmt-duration (- (get-universal-time) *bridge-started*))
+            (length *queue*) canary-age pause
+            (cmd-recent-incidents))))
+
+(defun cmd-restart ()
+  (if (cmd-cd-recent "restart" 120)
+      "restart was just requested; cooldown is 2 min"
+      (progn
+        ;; detached: the killer must survive this bridge's own death
+        (ignore-errors
+          (sb-ext:run-program "/bin/sh"
+                              (list "-c"
+                                    "sleep 3; /usr/bin/tmux kill-session -t xmpp-bridge || true")
+                              :wait nil :search t))
+        "restarting the bridge in 3s; the watchdog will bring it back within ~5 min (the agent session is NOT touched)")))
+
+(defun cmd-compact ()
+  (cond ((cmd-cd-recent "compact" 300)
+         "compaction was just requested; cooldown is 5 min")
+        (t
+         (let* ((raw (cmd-status-raw))
+                (state (and raw (cmd-sexp-field raw "STATE")))
+                (session (or (and raw (cmd-sexp-field raw "SESSION"))
+                             (unless (string= *al-session-id* "auto") *al-session-id*))))
+           (cond ((null raw) "cannot compact: agent status unavailable")
+                 ((null session) "cannot compact: no session resolved")
+                 ((and state (not (string-equal state ":IDLE")))
+                  (format nil "agent is ~a; /compact only works while idle" state))
+                 (t
+                  (run-capture
+                   (list *al-bin* "localgroup" "tell" session "(compact)") 30)
+                  "compaction requested; /status shows the ctx meter drop when it lands"))))))
+
+(defun cmd-canary ()
+  (if (cmd-cd-recent "canary" 600)
+      "canary was just triggered; cooldown is 10 min"
+      (progn
+        ;; the watchdog's cadence mark: gone => canary runs next cycle
+        (ignore-errors (delete-file (home-path ".cache/saguaro-canary")))
+        "canary queued - the next watchdog cycle (within ~5 min) runs a full round trip; green in watchdog.log, or a page on failure")))
+
+(defun cmd-pause (args)
+  (cond ((or (string= args "off") (string= args "0"))
+         (ignore-errors (delete-file *pause-path*))
+         "watchdog pause lifted (auto-repair and pages back on)")
+        ((plusp (length args))
+         (let ((n (parse-integer args :junk-allowed t)))
+           (if (and n (plusp n) (<= n 72))
+               (progn
+                 (pause-write (* n 3600))
+                 (format nil "watchdog paused for ~ah - auto-repair and pages off; these commands keep working. /pause off to lift." n))
+               "usage: /pause <1-72 hours> | /pause off")))
+        (t
+         (let ((exp (watchdog-pause-expiry)))
+           (if exp
+               (format nil "watchdog paused, ~a left. /pause off to lift"
+                       (fmt-duration (- exp (get-universal-time))))
+               "watchdog is not paused. usage: /pause <1-72 hours> | /pause off")))))
+
+(defun handle-command (peer body)
+  (let* ((line (trim body))
+         (sp (position #\Space line))
+         (name (string-downcase (subseq line 0 (or sp (length line)))))
+         (args (if sp (trim (subseq line (1+ sp))) "")))
+    (log-line "COMMAND from ~a: ~a" peer (subseq line 0 (min 100 (length line))))
+    (deliver-notice peer :xmpp-private
+                    (cond ((string= name "/ping") (cmd-ping))
+                          ((string= name "/help") (cmd-help))
+                          ((string= name "/status") (cmd-status))
+                          ((string= name "/restart") (cmd-restart))
+                          ((string= name "/compact") (cmd-compact))
+                          ((string= name "/canary") (cmd-canary))
+                          ((string= name "/pause") (cmd-pause args))
+                          (t (format nil "unknown command ~a - /help lists the local commands; resend without the leading / to talk to the agent" name))))))
+
+;;; ---------------------------------------------------------------------
 ;;; incoming stanza dispatch
 ;;; ---------------------------------------------------------------------
 
@@ -1783,8 +1996,10 @@ inside attribute values do not affect depth."
                     (handle-group-message room nick (trim body)))))
                ((member type '("chat" "normal") :test #'string=)
                 (let ((bare (subseq from 0 (or (position #\/ from) (length from)))))
-                  (if (stanza-allowed-p bare)
-                      (handle-dm bare (trim body))
+                    (if (stanza-allowed-p bare)
+                        (if (command-p (trim body))
+                            (handle-command bare (trim body))
+                            (handle-dm bare (trim body)))
                       (log-line "IGNORED DM from ~a (not in allow list)" bare))))))))))
 
 (defun handle-group-message (room nick body)
