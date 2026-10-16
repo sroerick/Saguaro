@@ -72,6 +72,14 @@ also runs the end-to-end canary (canary.py) on the `canary_secs` cadence:
 wake, connect, deliver one line into `canary_muc` (a test room -- never
 the owner's DM), and alert you when any hop fails.
 
+Safety valves (2026-10-16): every watchdog action writes a timestamped
+incident bundle under `harness/incidents/`; pages ride XMPP with ntfy as
+the independent fallback (and a second unconditional page for critical
+events -- point `SAGUARO_NTFY_ENV` at a file defining `NTFY_URL` and
+`NTFY_TOPIC`). A crash-loop breaker counts watchdog-driven restarts: three
+within 30 minutes trips it, auto-repair goes hands-off for 45 minutes with
+one loud page, then one fresh attempt is allowed.
+
 ## 7. Optional: Pricklypear-backed memory (default: off)
 
 Out of the box, the agent's persistent memory is autolith's native local

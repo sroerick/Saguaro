@@ -18,8 +18,16 @@ Finally, when [bridge] canary = "on" and the cadence ([bridge] canary_secs)
 has elapsed, run the end-to-end canary (canary.py): wake, connect, deliver
 one message into the canary room. Alerts the owner on failure.
 
+Safety valves (added 2026-10-16): every watchdog action lands a timestamped
+incident bundle under harness/incidents/. Pages ride the XMPP push, with
+ntfy as the independent fallback channel (and a second, unconditional page
+for critical events). A crash-loop breaker counts watchdog-driven restarts:
+3 within 30 min trips it - auto-repair goes hands-off for 45 min with one
+loud page, then one fresh attempt is allowed.
+
 Silent exit when everything is healthy.
 """
+import os
 import re
 import subprocess
 import sys
@@ -59,6 +67,24 @@ TURN_DEFER_SECS = float(A.get("turn_timeout_secs", 900)) + 600
 NO_TEXT_MARK = Path.home() / ".cache" / "saguaro-no-text-turn"
 NO_TEXT_ALERTED = Path.home() / ".cache" / "saguaro-no-text-alerted"
 NO_TEXT_MAX_AGE = 7200  # ignore a marker older than this (stale)
+
+# --- crash-loop breaker (added 2026-10-16) ----------------------------------
+# Repeated auto-repairs can amplify a crash (openclaw's lesson: 3 unclean
+# boots in 5 min trip a breaker). Every watchdog-driven restart is counted;
+# BREAKER_TRIP within BREAKER_WINDOW opens the breaker: auto-repair goes
+# hands-off for BREAKER_COOLDOWN with one loud page, then one fresh attempt.
+BREAKER_HISTORY = Path.home() / ".cache" / "saguaro-restart-history"
+BREAKER_MARK = Path.home() / ".cache" / "saguaro-breaker"
+BREAKER_WINDOW = 1800       # 30 min lookback
+BREAKER_TRIP = 3            # restarts within the window that trip it
+BREAKER_COOLDOWN = 2700     # 45 min hands-off after a trip
+
+# --- independent alert channel (added 2026-10-16) ---------------------------
+# The XMPP page rides the transport being repaired. Critical pages (and any
+# failed XMPP push) also go to ntfy - the channel public-audit already pages
+# through. Env file defines NTFY_URL / NTFY_TOPIC.
+NTFY_ENV = os.environ.get("SAGUARO_NTFY_ENV",
+                          "/home/al/.config/pricklypear/env-agent-ntfy")
 
 
 def sh(cmd, timeout=90):
@@ -176,15 +202,15 @@ def bridge_spinning():
     return False  # healthy: stay silent
 
 
-def capture_crash(tag):
-    """Preserve WHY the bridge died: the tmux pane (SBCL's unhandled-error
-    backtrace / exit message, kept alive by remain-on-exit) plus the tail of
-    bridge.err, into a timestamped crash-<ts>.log beside the harness. Never
-    raises - a failed capture must not break the repair."""
+def incident(kind, note):
+    """Timestamped incident bundle under harness/incidents/: why the watchdog
+    acted plus the evidence (tmux pane tail, bridge.err tail, agent status),
+    so any debugging session can reconstruct every action. Never raises - a
+    failed capture must not break the repair."""
     try:
         here = Path(__file__).resolve().parent
         stamp = time.strftime("%Y%m%d-%H%M%S")
-        out = ["=== crash %s (%s) ===" % (stamp, tag)]
+        out = ["=== incident %s (%s) ===" % (stamp, kind), note, ""]
         cap = sh(["/usr/bin/tmux", "capture-pane", "-p", "-S", "-300",
                   "-t", "xmpp-bridge"], timeout=20)
         out.append("--- tmux pane (tail) ---")
@@ -194,10 +220,90 @@ def capture_crash(tag):
             lines = err.read_text(errors="replace").splitlines()[-200:]
             out.append("--- bridge.err (tail) ---")
             out.extend(lines or ["(empty)"])
-        (here / ("crash-%s.log" % stamp)).write_text("\n".join(out) + "\n")
-        print("watchdog: crash captured to crash-%s.log" % stamp, flush=True)
+        out.append("--- agent status ---")
+        out.append(_status_raw() or "(status unavailable)")
+        d = here / "incidents"
+        d.mkdir(exist_ok=True)
+        f = d / ("%s-%s.log" % (stamp, kind))
+        f.write_text("\n".join(out) + "\n")
+        print("watchdog: incident captured to %s" % f.name, flush=True)
     except Exception as e:
-        print("watchdog: crash capture failed: %s" % e, flush=True)
+        print("watchdog: incident capture failed: %s" % e, flush=True)
+
+
+def ntfy(msg, title="saguaro watchdog"):
+    """Post to the ntfy channel public-audit already pages through (env file
+    defines NTFY_URL/NTFY_TOPIC). Returns the HTTP code, '000' on failure.
+    Never raises."""
+    try:
+        r = subprocess.run(
+            ["/bin/sh", "-c",
+             '. "%s" 2>/dev/null; '
+             'curl -s -m 15 -o /dev/null -w "%%{http_code}" '
+             '-H "Title: %s" -d "$BODY" "$NTFY_URL/$NTFY_TOPIC"'
+             % (NTFY_ENV, title.replace('"', ""))],
+            capture_output=True, text=True, timeout=25,
+            env=dict(os.environ, BODY=msg))
+        return r.stdout.strip() or "000"
+    except Exception as e:
+        print("watchdog: ntfy failed: %s" % e, flush=True)
+        return "000"
+
+
+def alert(msg, kind="alert", critical=False):
+    """Every watchdog page: bundle the incident, push the XMPP DM, and page
+    ntfy too when the push failed or the event is critical - ntfy rides a
+    channel independent of the transport being repaired."""
+    incident(kind, msg)
+    delivered = False
+    try:
+        push(B["allow"][0], msg)
+        delivered = True
+    except Exception as e:
+        print("watchdog: push failed: %s" % e, flush=True)
+    if critical or not delivered:
+        code = ntfy(msg, title="saguaro watchdog: %s" % kind)
+        print("watchdog: ntfy page (critical=%s, xmpp=%s) code=%s"
+              % (critical, delivered, code), flush=True)
+
+
+def note_restart():
+    """Record one watchdog-driven restart for the breaker."""
+    try:
+        BREAKER_HISTORY.parent.mkdir(parents=True, exist_ok=True)
+        with BREAKER_HISTORY.open("a") as f:
+            f.write("%d\n" % int(time.time()))
+    except (OSError, ValueError) as e:
+        print("watchdog: breaker history write failed: %s" % e, flush=True)
+
+
+def breaker_open():
+    """True while auto-repair is suppressed. Trips after BREAKER_TRIP
+    watchdog-driven restarts within BREAKER_WINDOW; stays open for
+    BREAKER_COOLDOWN with one loud page, then one fresh cycle is allowed."""
+    try:
+        if time.time() - BREAKER_MARK.stat().st_mtime < BREAKER_COOLDOWN:
+            return True
+    except OSError:
+        pass
+    now = time.time()
+    try:
+        entries = [int(l) for l in BREAKER_HISTORY.read_text().split()
+                   if l.strip()]
+    except (OSError, ValueError):
+        return False
+    recent = [t for t in entries if now - t < BREAKER_WINDOW]
+    if len(recent) < BREAKER_TRIP:
+        return False
+    try:
+        BREAKER_MARK.touch()
+    except OSError:
+        pass
+    alert("watchdog: CRASH-LOOP BREAKER TRIPPED - %d restarts in %d min; "
+          "auto-repair is off for %d min. Needs eyes."
+          % (len(recent), BREAKER_WINDOW // 60, BREAKER_COOLDOWN // 60),
+          kind="breaker", critical=True)
+    return True
 
 
 # --- proactive compaction guard (added 2026-10-10) ------------------------
@@ -343,14 +449,11 @@ def check_compact_guard(rec):
         pass
     ok = rescue_compact(rec.get("session"))
     if not ok:
-        try:
-            push(B["allow"][0],
-                 "watchdog: the agent's conversation reached %dK tokens and "
-                 "could NOT be auto-compacted (the compaction bug). It needs "
-                 "manual eyes - rotate the standing conversation or force a "
-                 "compaction under another model." % k)
-        except Exception as e:
-            print("watchdog: push failed: %s" % e, flush=True)
+        alert("watchdog: the agent's conversation reached %dK tokens and "
+              "could NOT be auto-compacted (the compaction bug). It needs "
+              "manual eyes - rotate the standing conversation or force a "
+              "compaction under another model." % k,
+              kind="compact-guard-failed")
     return ok
 
 
@@ -388,10 +491,7 @@ def check_no_text_turn(rec, auto_fixed=False):
                "kimi in-image; if this still happens, check "
                "/home/al/.cache/compact-model-swap.log, then re-ask or rotate "
                "the conversation." % (age / 60.0))
-    try:
-        push(B["allow"][0], msg)
-    except Exception as e:
-        print("watchdog: push failed: %s" % e, flush=True)
+    alert(msg, kind="no-text-turn")
 
 
 def bridge_restart_recent():
@@ -402,8 +502,12 @@ def bridge_restart_recent():
 
 
 def restart_bridge(reason):
+    if breaker_open():
+        print("watchdog: breaker open - NOT restarting bridge (%s)" % reason,
+              flush=True)
+        return
     print("watchdog: %s -> restarting xmpp-bridge" % reason, flush=True)
-    capture_crash(reason)
+    incident("bridge-restart", reason)
     sh(["/usr/bin/tmux", "kill-session", "-t", "xmpp-bridge"], timeout=30)
     time.sleep(2)
     sh(["/bin/sh", START], timeout=120)
@@ -414,13 +518,11 @@ def restart_bridge(reason):
         BRIDGE_RESTART_MARK.touch()
     except OSError:
         pass
+    note_restart()
     if not back:
-        try:
-            push(B["allow"][0],
-                 "watchdog: the XMPP bridge was spinning at ~100% CPU; I "
-                 "restarted it but it is NOT back up — needs eyes.")
-        except Exception as e:
-            print("watchdog: push failed: %s" % e, flush=True)
+        alert("watchdog: the XMPP bridge was spinning at ~100% CPU; I "
+              "restarted it but it is NOT back up — needs eyes.",
+              kind="bridge-restart-failed")
     else:
         print("watchdog: bridge restarted cleanly (quiet; no push)", flush=True)
 
@@ -468,9 +570,12 @@ def log_stale(rec):
 
 
 def recover_and_alert(reason):
+    if breaker_open():
+        print("watchdog: breaker open - NOT recovering (%s)" % reason,
+              flush=True)
+        return
     print("watchdog: %s -> restarting" % reason, flush=True)
-    if "bridge" in reason:
-        capture_crash(reason)
+    incident("recover", reason)
     sh(["/bin/sh", START], timeout=120)
     time.sleep(30)
     back = []
@@ -478,11 +583,10 @@ def recover_and_alert(reason):
         back.append("agent")
     if bridge_alive():
         back.append("bridge")
-    try:
-        push(B["allow"][0], "watchdog: %s. Restarted; back online: %s."
-             % (reason, ", ".join(back) or "nothing yet — needs eyes"))
-    except Exception as e:
-        print("watchdog: push failed: %s" % e, flush=True)
+    note_restart()
+    alert("watchdog: %s. Restarted; back online: %s."
+          % (reason, ", ".join(back) or "nothing yet — needs eyes"),
+          kind="recover")
 
 
 def main():
@@ -524,17 +628,19 @@ def main():
     if busy and rec.get("pid") and image_idle_dead(rec["pid"]) and log_stale(rec):
         print("watchdog: turn looks hung (0 CPU, no sockets, stale log)",
               flush=True)
+        if breaker_open():
+            print("watchdog: breaker open - NOT killing the hung turn",
+                  flush=True)
+            return
         sh([A["bin"], "localgroup", "kill", rec["session"]], timeout=120)
         time.sleep(2)
         sh(["/bin/sh", START], timeout=120)
         time.sleep(30)
-        try:
-            push(B["allow"][0],
-                 "watchdog: the agent's turn was hung (no CPU/network for "
-                 "10+ min), so I killed and resumed it. Conversation history "
-                 "is intact — re-ask your question.")
-        except Exception as e:
-            print("watchdog: push failed: %s" % e, flush=True)
+        note_restart()
+        alert("watchdog: the agent's turn was hung (no CPU/network for "
+              "10+ min), so I killed and resumed it. Conversation history "
+              "is intact — re-ask your question.",
+              kind="hung-turn")
         return
 
     # Proactively keep the conversation below the size at which the model can
