@@ -2,4 +2,5 @@
 13 * * * * /home/agent/saguaro/harness/venv/bin/python /home/agent/saguaro/harness/heartbeat.py >> /home/agent/saguaro/harness/heartbeat.log 2>&1
 */5 * * * * /home/agent/saguaro/harness/venv/bin/python /home/agent/saguaro/harness/watchdog.py >> /home/agent/saguaro/harness/watchdog.log 2>&1
 # optional: weekly wire-cost profile; see harness/scripts/cost-profile.py
-#20 15 * * 1 /home/agent/saguaro/harness/venv/bin/python /home/agent/saguaro/harness/scripts/cost-profile.py --days 7 >> /home/agent/saguaro/harness/cost-profile.log 2>&1
+# daily repo/image hygiene: push main to origin when ahead, log drift (repo, image-commit age, ENGINE_PIN) to harness/hygiene.log; see harness/scripts/hygiene.sh
+30 4 * * * /bin/sh /home/agent/saguaro/harness/scripts/hygiene.sh >/dev/null 2>&1
