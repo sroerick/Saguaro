@@ -67,10 +67,12 @@ client. It answers from the session you just started.
 
 heartbeat.py nudges the session hourly so a long-running agent keeps its
 rhythm; watchdog.py checks every five minutes and restarts the bridge or
-the session if either died. With `[bridge] canary = "on"` the watchdog
 also runs the end-to-end canary (canary.py) on the `canary_secs` cadence:
-wake, connect, deliver one line into `canary_muc` (a test room -- never
-the owner's DM), and alert you when any hop fails.
+wake, connect, deliver a tokenized ping into `canary_muc` (a test room --
+never the owner's DM) with an @trigger mention, then verify the round
+trip on the NEXT run: the agent's reply in the room carrying the token,
+or an assistant record in the conversation after the ping. Green means
+the whole chat path worked, not just a delivered stanza.
 
 Safety valves (2026-10-16): every watchdog action writes a timestamped
 incident bundle under `harness/incidents/`; pages ride XMPP with ntfy as
@@ -79,6 +81,13 @@ events -- point `SAGUARO_NTFY_ENV` at a file defining `NTFY_URL` and
 `NTFY_TOPIC`). A crash-loop breaker counts watchdog-driven restarts: three
 within 30 minutes trips it, auto-repair goes hands-off for 45 minutes with
 one loud page, then one fresh attempt is allowed.
+
+When a session still needs hands, the evidence is already on disk:
+`harness/hygiene.log` (repo/image/pin drift), `harness/incidents/` (one
+bundle per watchdog action, with pane + log evidence), `watchdog.log`
+(every check and restart), and `~/.cache/saguaro-restart-history` (the
+breaker's raw restart log). Whatever a manual session fixes, fold back
+into the harness -- that is what makes the next session unnecessary.
 
 ## 7. Optional: Pricklypear-backed memory (default: off)
 
