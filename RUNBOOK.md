@@ -98,6 +98,11 @@ automates, with cooldowns. Unknown commands get a short local reply, and
 non-allowlisted senders never reach the command layer. Anything without
 a leading `/` goes to the agent as prose, exactly as before.
 
+Sandbox-testing bridge.lisp: SAGUARO_NO_MAIN=1 skips main(), but set it
+inside the target user's command (`su -` resets the environment) -- a
+bare load without it starts a second live bridge that fights the real
+one for the XMPP resource (observed 2026-10-16).
+
 ## 7. Optional: Pricklypear-backed memory (default: off)
 
 Out of the box, the agent's persistent memory is autolith's native local
