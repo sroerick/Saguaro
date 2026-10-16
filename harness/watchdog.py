@@ -572,6 +572,20 @@ def log_stale(rec):
     return (time.time() - files[-1].stat().st_mtime) > 600
 
 
+def nudge_interrupted(session, reason):
+    """After a watchdog-forced restart, tell the agent its in-flight turn
+    died so it can check the conversation tail and finish the owner's
+    request (openclaw-style recovery: interrupted turns are resumed with a
+    synthetic message, never silently dropped)."""
+    if not session:
+        return
+    msg = ("[watchdog] %s: your previous turn was interrupted by a restart "
+           "and the owner's last message may be unanswered. Check the end of "
+           "the conversation, then re-ask or continue." % reason)
+    sh([A["bin"], "localgroup", "tell", session, msg], timeout=60)
+    print("watchdog: interrupted-turn nudge sent to %s" % session, flush=True)
+
+
 def recover_and_alert(reason):
     if breaker_open():
         print("watchdog: breaker open - NOT recovering (%s)" % reason,
@@ -581,12 +595,15 @@ def recover_and_alert(reason):
     incident("recover", reason)
     sh(["/bin/sh", START], timeout=120)
     time.sleep(30)
+    rr = agent_status()
     back = []
-    if agent_status():
+    if rr:
         back.append("agent")
     if bridge_alive():
         back.append("bridge")
     note_restart()
+    if rr:
+        nudge_interrupted(rr[0].get("session"), reason)
     alert("watchdog: %s. Restarted; back online: %s."
           % (reason, ", ".join(back) or "nothing yet — needs eyes"),
           kind="recover")
@@ -640,6 +657,7 @@ def main():
         sh(["/bin/sh", START], timeout=120)
         time.sleep(30)
         note_restart()
+        nudge_interrupted(rec["session"], "hung turn killed and resumed")
         alert("watchdog: the agent's turn was hung (no CPU/network for "
               "10+ min), so I killed and resumed it. Conversation history "
               "is intact — re-ask your question.",
