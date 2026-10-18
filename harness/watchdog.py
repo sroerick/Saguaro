@@ -25,6 +25,12 @@ for critical events). A crash-loop breaker counts watchdog-driven restarts:
 3 within 30 min trips it - auto-repair goes hands-off for 45 min with one
 loud page, then one fresh attempt is allowed.
 
+Probe-vs-session rule (added 2026-10-18): a probe that cannot RUN is never
+evidence that a service is down. Under process exhaustion (fork EAGAIN) the
+watchdog skips every repair, retries the status probe, and pages once with
+the process count instead - it must never restart a healthy agent because
+`localgroup status` could not be spawned.
+
 Silent exit when everything is healthy.
 """
 import os
@@ -108,16 +114,125 @@ NTFY_ENV = os.environ.get("SAGUARO_NTFY_ENV",
                           "/home/al/.config/pricklypear/env-agent-ntfy")
 
 
+# --- probe-vs-session safety (added 2026-10-18) -----------------------------
+# A probe that cannot RUN is not evidence that a service is down.
+# 2026-10-18: `al` exhausted its 128-process limit (RLIMIT_NPROC) because 38
+# stuck `pp-local sync` children had piled up since 04:53. `localgroup status`
+# could not be spawned AT ALL (BlockingIOError / Errno 35), agent_status()
+# turned that into [], main() read it as "no autolith session answering" and
+# tried to restart a HEALTHY agent every 5 min - only the same fork failure
+# stopped start-sessions.sh from killing the live session. Fix: distinguish
+# "the CLI ran and reported no session" (repair) from "we could not ask"
+# (retry, page once, never repair), and refuse every destructive action in a
+# cycle where any probe failed.
+STATUS_ATTEMPTS = 3             # tries before the probe counts as unusable
+STATUS_RETRY_SECS = 5
+STATUS_UNKNOWN_MARK = Path.home() / ".cache" / "saguaro-status-unknown"
+STATUS_UNKNOWN_MIN_GAP = 1800   # page at most once per 30 min
+
+
+class StatusUnknown(Exception):
+    """`localgroup status` could not be RUN (fork/exec/resource failure), so we
+    have no evidence either way about the session. Never 'the session is gone'."""
+
+
+_SH_FAIL = None   # last probe-level failure this cycle (None = all probes ran)
+
+
+def _note_probe_failure(what):
+    global _SH_FAIL
+    if _SH_FAIL is None:
+        _SH_FAIL = what
+
+
+def probes_ok():
+    """True when every shell probe so far this cycle actually ran. When False
+    the watchdog is half-blind and must not repair anything: a skipped repair
+    costs 5 minutes, a wrong one costs a live session."""
+    return _SH_FAIL is None
+
+
+RESOURCE_ERRNOS = (11, 12, 23, 24, 55)   # EAGAIN ENOMEM ENFILE EMFILE ENOBUFS
+
+
+def _resource_error(e):
+    return (isinstance(e, BlockingIOError)
+            or getattr(e, "errno", None) in RESOURCE_ERRNOS)
+
+
 def sh(cmd, timeout=90):
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    """Run a probe. Never raises: a probe that cannot run (fork EAGAIN under
+    process exhaustion, timeout) is recorded in _SH_FAIL and returned as a
+    failed CompletedProcess, so callers degrade instead of killing the cycle."""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _note_probe_failure("timeout running %s" % (cmd[0],))
+        print("watchdog: probe timed out: %s" % (cmd[0],), flush=True)
+    except OSError as e:
+        _note_probe_failure("%s running %s" % (e, cmd[0]))
+        print("watchdog: probe could not run: %s (%s)" % (cmd[0], e), flush=True)
+    return subprocess.CompletedProcess(cmd, 127, "", "probe failed")
 
 
 def agent_status():
+    """Session records from `localgroup status`.
+
+    [] means the CLI RAN and reported no session (a real outage -> repair).
+    StatusUnknown means the probe could not run at all -> never repair."""
     try:
         return bridge.status_records()
     except Exception as e:
         print("watchdog: status failed: %s" % e, flush=True)
+        raise StatusUnknown("%s: %s" % (e.__class__.__name__, e))
+
+
+def status_confirmed():
+    """Session records, tolerating a flaky read. Raises StatusUnknown when the
+    probe stays unusable after STATUS_ATTEMPTS tries, so a resource-starved box
+    can never make the watchdog think the agent died."""
+    last = "unknown"
+    for attempt in range(1, STATUS_ATTEMPTS + 1):
+        try:
+            return agent_status()
+        except StatusUnknown as e:
+            last = str(e)
+            print("watchdog: status probe unusable (attempt %d/%d): %s"
+                  % (attempt, STATUS_ATTEMPTS, e), flush=True)
+            if attempt < STATUS_ATTEMPTS:
+                time.sleep(STATUS_RETRY_SECS)
+    raise StatusUnknown(last)
+
+
+def status_tolerant():
+    """Session records, [] when the probe is unusable. For post-repair health
+    reporting only - never a reason to repair."""
+    try:
+        return agent_status()
+    except StatusUnknown:
         return []
+
+
+def alert_probe_failure(err):
+    """Page (debounced) that the watchdog is blind, with the process count as
+    evidence. Deliberately does NOT repair - see the block comment above."""
+    try:
+        if (time.time() - STATUS_UNKNOWN_MARK.stat().st_mtime) < STATUS_UNKNOWN_MIN_GAP:
+            print("watchdog: status still unprobeable; page suppressed", flush=True)
+            return
+    except OSError:
+        pass
+    try:
+        STATUS_UNKNOWN_MARK.parent.mkdir(parents=True, exist_ok=True)
+        STATUS_UNKNOWN_MARK.touch()
+    except OSError:
+        pass
+    nproc = len(sh(["/bin/ps", "-U", "al", "-o", "pid="]).stdout.split())
+    alert("watchdog: I could not RUN `localgroup status` (%s) - the box looks "
+          "resource-starved (al processes: %d; check RLIMIT_NPROC / stuck "
+          "cron children). I did NOT restart anything: a probe that cannot "
+          "run is not a dead agent." % (err, nproc),
+          kind="probe-failed", critical=True)
 
 
 def bridge_session_exists():
@@ -526,6 +641,10 @@ def bridge_restart_recent():
 
 
 def restart_bridge(reason):
+    if not probes_ok():
+        print("watchdog: a probe failed this cycle (%s) - NOT restarting "
+              "bridge (%s)" % (_SH_FAIL, reason), flush=True)
+        return
     if breaker_open():
         print("watchdog: breaker open - NOT restarting bridge (%s)" % reason,
               flush=True)
@@ -608,6 +727,10 @@ def nudge_interrupted(session, reason):
 
 
 def recover_and_alert(reason):
+    if not probes_ok():
+        print("watchdog: a probe failed this cycle (%s) - NOT recovering (%s)"
+              % (_SH_FAIL, reason), flush=True)
+        return
     if breaker_open():
         print("watchdog: breaker open - NOT recovering (%s)" % reason,
               flush=True)
@@ -616,7 +739,7 @@ def recover_and_alert(reason):
     incident("recover", reason)
     sh(["/bin/sh", START], timeout=120)
     time.sleep(30)
-    rr = agent_status()
+    rr = status_tolerant()
     back = []
     if rr:
         back.append("agent")
@@ -631,13 +754,19 @@ def recover_and_alert(reason):
 
 
 def main():
+    global _SH_FAIL
+    _SH_FAIL = None          # per-cycle probe health (see probe-vs-session)
     pause_left = watchdog_pause_left()
     if pause_left is not None:
         print("watchdog: paused for %s - skipping cycle (chat commands still work)"
               % fmt_secs(pause_left), flush=True)
         return
-    recs = agent_status()
-    recs = agent_status()
+    try:
+        recs = status_confirmed()
+    except StatusUnknown as e:
+        # 2026-10-18: do NOT read a probe that could not run as a dead agent.
+        alert_probe_failure(e)
+        return
     if not recs:
         recover_and_alert("no autolith session answering")
         return
