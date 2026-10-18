@@ -119,4 +119,30 @@ g["B"] = {"canary": "on", "canary_secs": "3600"}
 print("8) canary_due with an outstanding ping: %s" % W.canary_due())
 assert W.canary_due() is True, "8) FAILED: outstanding ping not verified each cycle"
 
+# 9: phase B end-to-end on an ANSWERED ping (temp marker, stubbed green/fail)
+import tempfile
+
+tmp = Path(tempfile.mkdtemp()) / "saguaro-canary-pending"
+tmp.write_text("canary-1792338723")
+C.CANARY_PENDING = tmp
+C.muc_history = lambda room, max_n=30: []      # force the conversation path
+greens = []
+C.green = lambda mark: greens.append(mark)
+C.fail = lambda msg: (_ for _ in ()).throw(
+    AssertionError("9) FAILED: phase B paged the owner: %s" % msg))
+rc = C.main()
+print("9) phase B (answered ping): rc=%s greens=%d marker_gone=%s"
+      % (rc, len(greens), not tmp.exists()))
+assert rc == 0 and greens and not tmp.exists(), "9) FAILED: phase B did not green"
+
+# 10: phase B on an UNANSWERED ping stays pending, does not page
+tmp2 = Path(tempfile.mkdtemp()) / "saguaro-canary-pending"
+tmp2.write_text("canary-DEADBEEF")
+C.CANARY_PENDING = tmp2
+rc = C.main()
+print("10) phase B (unanswered ping): rc=%s greens=%d marker_kept=%s"
+      % (rc, len(greens), tmp2.exists()))
+assert rc == 0 and len(greens) == 1 and tmp2.exists(), \
+    "10) FAILED: unanswered ping did not stay pending"
+
 print("ALL TESTS PASSED")
