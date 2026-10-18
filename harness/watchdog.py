@@ -670,11 +670,26 @@ def restart_bridge(reason):
         print("watchdog: bridge restarted cleanly (quiet; no push)", flush=True)
 
 
+CANARY_PENDING_MARK = Path.home() / ".cache" / "saguaro-canary-pending"
+
+
 def canary_due():
-    """True when the canary is enabled and its cadence has elapsed.
-    The state file's mtime is the last green run."""
+    """True when the canary is enabled and either its cadence has elapsed or a
+    ping is outstanding, so a round trip is VERIFIED every cycle rather than
+    once per cadence.
+
+    2026-10-18: with canary_secs = 3600 the old behaviour gave exactly ONE
+    verification attempt per ping, and it could already be past the reply
+    deadline (ping 15:52 -> first check 16:30 = 38 min), so a single
+    unverifiable check paged the owner about a healthy agent. The state
+    file's mtime is still the last green run."""
     if str(B.get("canary", "off")).lower() != "on":
         return False
+    try:
+        if CANARY_PENDING_MARK.exists():
+            return True
+    except OSError:
+        pass
     try:
         secs = float(B.get("canary_secs", 21600))
     except (TypeError, ValueError):
