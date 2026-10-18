@@ -9,11 +9,13 @@ delivered stanza alone proves nothing - the 2026-10-09 outage showed a
      authenticate AND the bridge holds its server connection), then post a
      tokenized ping into the canary room. The @trigger mention makes the
      bridge enqueue it into the agent's conversation.
-  B. verify  - on the NEXT run, green-light only when the round trip is
-     proven: the agent's reply in the canary room carries the token, or an
-     assistant record landed in the conversation after the ping. No
-     confirmation within canary_reply_secs (default 30 min) pages the
-     owner.
+  B. verify  - on every watchdog cycle while the ping is outstanding,
+     green-light only when the round trip is proven: the agent's reply in
+     the canary room carries the token, or an assistant record landed in
+     the conversation after the ping. No confirmation within the reply
+     deadline (canary_reply_secs, never less than one full ping cadence +
+     10 min - a busy agent's answer can legitimately take that long) pages
+     the owner.
 
 Run by watchdog.py on the [bridge] canary cadence, or by hand:
 
@@ -35,7 +37,15 @@ B = bridge.B
 XMPP_C2S_PORT = "5222"   # standard client-to-server port; revisit if the server moves
 
 CANARY_PENDING = Path.home() / ".cache" / "saguaro-canary-pending"
+PING_SECS = float(B.get("canary_secs", 21600))
 REPLY_SECS = float(B.get("canary_reply_secs", 1800))
+# 2026-10-18: the reply deadline must cover at least one full PING cadence plus
+# slack. With canary_secs = 3600 and a 1800 s deadline the FIRST verification
+# attempt could already be overdue (ping 15:52 -> next run 16:30 = 38 min), so
+# one unverifiable check paged the owner about a healthy agent. Verification
+# itself runs on every watchdog cycle while a ping is outstanding
+# (watchdog.canary_due), so this is an outer bound, not the check interval.
+REPLY_SECS = max(REPLY_SECS, PING_SECS + 600)
 
 
 def bridge_pid():
@@ -131,13 +141,28 @@ def green(mark):
 def muc_history(room, max_n=30):
     """Recent (nick, body) messages from ROOM via say.lisp history, or [].
     say.lisp joins under muc_nick-say, so this never collides with the
-    live bridge."""
+    live bridge.
+
+    2026-10-18: say the quiet part out loud. This used to return [] silently
+    on a failed/timed-out say.lisp, which hid why phase B fell through to the
+    conversation check (and a false FAIL looked like a broken chat path)."""
     say = Path(__file__).resolve().parent / "say.lisp"
     try:
         proc = subprocess.run(
             ["/usr/local/bin/sbcl", "--script", str(say), "history", room,
              str(max_n)], capture_output=True, text=True, timeout=60)
-    except (subprocess.TimeoutExpired, OSError):
+    except subprocess.TimeoutExpired:
+        print("canary: MUC history timed out (60s) - using the conversation "
+              "check for this pass", flush=True)
+        return []
+    except OSError as e:
+        print("canary: MUC history could not run (%s) - using the "
+              "conversation check for this pass" % e, flush=True)
+        return []
+    if proc.returncode != 0:
+        print("canary: MUC history failed (rc=%d): %s"
+              % (proc.returncode,
+                 " ".join((proc.stderr or "").split())[:200]), flush=True)
         return []
     out = []
     for ln in (proc.stdout or "").splitlines():
@@ -154,7 +179,17 @@ def muc_history(room, max_n=30):
 
 def conversation_round_trip(conv, token):
     """(ok, detail): the tokenized ping reached the agent's conversation AND
-    an assistant reply was recorded after it."""
+    an assistant reply carrying the token landed after it.
+
+    2026-10-18: anchor on the FIRST record mentioning the token - that is the
+    ping. This used to take the LAST mention, but the reply almost always
+    echoes the token, so `after` excluded the reply itself: every ping whose
+    reply was the newest mention read as "no assistant reply after it yet"
+    (and older tokens read green only by accident, when some later turn
+    happened to quote them and another reply followed). The reply must also
+    CARRY the token: in a busy conversation some assistant text always lands
+    after a ping, so accepting any of it would green-light a ping nobody
+    answered."""
     try:
         recs = bridge.all_records(conv)
     except Exception as e:
@@ -163,13 +198,20 @@ def conversation_round_trip(conv, token):
     for r in recs:
         if token in " ".join(r.get("strings", [])):
             tok_seq = r.get("seq")
+            break
     if tok_seq is None:
         return False, "token %s never reached conversation %s" % (token, conv)
     after = [r for r in recs if r.get("seq", 0) > tok_seq]
-    if bridge.reply_texts(after):
-        return True, "assistant reply recorded after the ping"
-    return False, ("ping %s is in conversation %s but no assistant reply "
-                   "after it yet" % (token, conv))
+    texts = bridge.reply_texts(after)
+    if any(token in t for t in texts):
+        return True, ("assistant reply carrying the token recorded after the "
+                      "ping (seq %s)" % tok_seq)
+    if texts:
+        return False, ("ping %s (seq %s) is in conversation %s; an assistant "
+                       "message landed after it but does not carry the token"
+                       % (token, tok_seq, conv))
+    return False, ("ping %s (seq %s) is in conversation %s but no assistant "
+                   "reply after it yet" % (token, tok_seq, conv))
 
 
 def main():
@@ -187,14 +229,14 @@ def main():
     if CANARY_PENDING.exists():
         token = CANARY_PENDING.read_text().strip()
         age = time.time() - CANARY_PENDING.stat().st_mtime
-        if room:
-            for n, body in muc_history(room):
-                if token in body and n == bridge_nick:
-                    green(mark)
-                    CANARY_PENDING.unlink()
-                    print("canary: round-trip ok (%s replied in %s, %.0f min)"
-                          % (bridge_nick, room, age / 60.0), flush=True)
-                    return 0
+        hist = muc_history(room) if room else []
+        for n, body in hist:
+            if token in body and n == bridge_nick:
+                green(mark)
+                CANARY_PENDING.unlink()
+                print("canary: round-trip ok (%s replied in %s, %.0f min)"
+                      % (bridge_nick, room, age / 60.0), flush=True)
+                return 0
         recs = bridge.status_records()
         conv = recs[0].get("conversation") if recs else None
         if conv:
@@ -206,15 +248,18 @@ def main():
                       % (detail, age / 60.0), flush=True)
                 return 0
             if age > REPLY_SECS:
-                fail("reply: %s (%.0f min old)" % (detail, age / 60.0))
+                fail("reply: %s (%.0f min old; canary room: no %s reply in "
+                     "the last %d message(s))"
+                     % (detail, age / 60.0, bridge_nick, len(hist)))
                 CANARY_PENDING.unlink()
                 return 1
             print("canary: reply pending (%.0f min): %s"
                   % (age / 60.0, detail), flush=True)
             return 0
         if age > REPLY_SECS:
-            fail("reply: no conversation known and no reply to %s (%.0f min)"
-                 % (token, age / 60.0))
+            fail("reply: no conversation known and no reply to %s (%.0f min; "
+                 "canary room: no %s reply in the last %d message(s))"
+                 % (token, age / 60.0, bridge_nick, len(hist)))
             CANARY_PENDING.unlink()
             return 1
         print("canary: reply pending (no conversation known)", flush=True)
