@@ -74,13 +74,6 @@ max_reply_chars = 8000
 #inbox_lib  = ""                         # libs/inbox/lib.pp source while log/inbox
                                          # is not yet in a deployed release
                                          # (default: harness/pp_inbox_lib.pp)
-#mirror_rooms = []                       # MUC jids whose traffic is RECORDED into
-                                         # the habitat chat log as tier-0 rows
-                                         # (from = speaker, mirrored_by = this
-                                         # agent, no to:). Arrival is recorded,
-                                         # never answered: a turn still comes
-                                         # only from @muc_trigger. Empty = off.
-                                         # nicks are XMPP-attested, not claimed.
 
 # --- CL bridge knobs (bridge.lisp, 2026-09-27) ---
 # turn_timeout_secs above is now a HARD CAP, not the primary limit: the CL
