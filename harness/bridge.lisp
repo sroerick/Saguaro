@@ -2003,8 +2003,6 @@ Anything without a leading / goes to the agent as prose."))
                       (log-line "IGNORED DM from ~a (not in allow list)" bare))))))))))
 
 (defun handle-group-message (room nick body)
-  ;; the log first: record the message whether or not anyone is addressed
-  (pp-mirror-room-message room nick body)
   (let ((trigger (cfg-str "bridge" "muc_trigger" "gregor")))
     ;; explicit @mention only
     (let ((pos (search (format nil "@~a" trigger) body :test #'char-equal)))
@@ -2058,60 +2056,6 @@ in-memory-only queue (lost DM observed 2026-10-09 ~06:50)."
 (defun queue-flatten (item)
   "Oldest body first."
   (nreverse (getf item :bodies)))
-
-;;; ---------------------------------------------------------------------
-;;; pp mirror: record XMPP room traffic into the pricklypear log
-;;; ---------------------------------------------------------------------
-
-(defparameter *pp-mirror-rooms* (cfg-list "pp" "mirror_rooms"))
-
-(defparameter *pp-mirror-queue* (list))
-(defparameter *pp-mirror-cap* 200)
-(defparameter *pp-mirror-timeout* 5)
-
-(defun pp-mirror-room-id (room)
-  "Map an XMPP MUC jid to its pricklypear room id: the localpart before '@'.
-ops@conference.example.net -> ops."
-  (let ((at (position #\@ room)))
-    (if at (subseq room 0 at) room)))
-
-(defun pp-mirror-room-message (room nick body)
-  "Queue ROOM traffic for the pricklypear log. Returns immediately.
-
-This does NOT call out to pricklypear: it runs inside the stanza handler, and a
-slow or unreachable image must never stall the XMPP stream (DMs, keepalives and
-reconnects all ride the same loop). The drain in the main loop does the I/O with
-a short timeout. Most recent traffic wins if the queue fills while PP is down -
-the log is a convenience copy, not the delivery path."
-  (when (and *pp-on* (member room *pp-mirror-rooms* :test #'string=))
-    (push (list room nick body) *pp-mirror-queue*)
-    (when (> (length *pp-mirror-queue*) *pp-mirror-cap*)
-      (setf *pp-mirror-queue*
-            (subseq *pp-mirror-queue* 0 *pp-mirror-cap*)))))
-
-(defun pp-mirror-drain (&optional (budget 5))
-  "Write up to BUDGET queued mirrors as TIER 0 rows: from = the attested nick,
-mirrored_by = this agent, and NO to: - durable, and waking nobody. A turn still
-comes only from an explicit @mention.
-
-Runs in the main loop, so a failing image costs latency here and nowhere else.
-A failed write is logged and dropped: the mirror is a record, not a delivery
-guarantee, and retrying stale chatter forever would be worse than losing it."
-  (loop repeat budget
-        while *pp-mirror-queue*
-        do (let* ((item (car (last *pp-mirror-queue*)))
-                  (room (first item))
-                  (nick (second item))
-                  (body (third item)))
-             (setf *pp-mirror-queue* (butlast *pp-mirror-queue*))
-             (handler-case
-                 (pp-eval (format nil "(chat/mirror-in ~a ~a ~a \"\")"
-                                  (pp-lisp-str (pp-mirror-room-id room))
-                                  (pp-lisp-str body)
-                                  (pp-lisp-str nick))
-                          *pp-mirror-timeout*)
-               (error (e)
-                 (log-line "pp mirror ~a <- ~a failed: ~a" room nick e))))))
 
 ;;; ---------------------------------------------------------------------
 ;;; pp dm poller (one consolidated turn per batch, like bridge.py)
@@ -2315,9 +2259,6 @@ guarantee, and retrying stale chatter forever would be worse than losing it."
                 (when (> (- (now) *main-last-pp-poll*) *pp-poll-secs*)
                   (setf *main-last-pp-poll* (now))
                   (pp-poll)))
-              ;; 5b. drain queued room mirrors (kept out of the stanza handler)
-              (when (and *pp-on* *pp-mirror-queue*)
-                (pp-mirror-drain))
               ;; 6. picker watcher
               (picker-watch)
 
