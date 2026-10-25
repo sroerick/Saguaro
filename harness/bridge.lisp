@@ -500,7 +500,29 @@ OpenBSD SBCL rejects run-program :output :string, hence pipes (glochid)."
   (let ((sec (gethash section *config*)))
     (and sec (eq (gethash key sec) :true))))
 
-(defparameter *pp-on* (and (cfg-bool* "pp" "enabled") (cfg-str "pp" "base")))
+;;; Which surfaces this bridge serves: "pp" (habitat DM, the default) and/or
+;;; "xmpp". XMPP is OPT-IN: it carries a JID, an openssl TLS tunnel, room
+;;; joins and an inbound-liveness watchdog, and none of that should be able
+;;; to take the habitat surface down. A surface listed here still needs its
+;;; own switch to actually run ([pp] enabled/base, [bridge] jid/mucs).
+;;;
+;;; Before this existed, xmpp_connect sat in front of the whole main loop,
+;;; so a dead or unconfigured XMPP stream meant pp-dm was never polled at
+;;; all -- the transport ranking was an accident of loop nesting.
+(defparameter *transports*
+  (let ((v (cfg-list "bridge" "transports")))
+    (if v
+        (mapcar (lambda (s) (string-downcase (trim s))) v)
+        (list "pp"))))
+
+(defun transport-on-p (name)
+  (and (member name *transports* :test #'string=) t))
+
+(defparameter *xmpp-on* (transport-on-p "xmpp"))
+
+(defparameter *pp-on* (and (transport-on-p "pp")
+                           (cfg-bool* "pp" "enabled")
+                           (cfg-str "pp" "base")))
 
 (defparameter *pp-base* (cfg-str "pp" "base"))
 (defparameter *pp-token-file* (cfg-str "pp" "token_file"))
@@ -2176,10 +2198,15 @@ in-memory-only queue (lost DM observed 2026-10-09 ~06:50)."
 
 (defun main ()
   (load-state)
-  ;; kill parentless s_client transports from a previous crash/bounce
-  ;; BEFORE we spawn our own (else they spin at PPID 1 forever)
-  (kill-orphan-transports)
-  (log-line "CL bridge starting (config ~a)" *config-path*)
+  (when *xmpp-on*
+    ;; kill parentless s_client transports from a previous crash/bounce
+    ;; BEFORE we spawn our own (else they spin at PPID 1 forever)
+    (kill-orphan-transports))
+  (log-line "CL bridge starting (config ~a) transports=[~{~a~^ ~}]"
+            *config-path* *transports*)
+  (unless (or *xmpp-on* *pp-on*)
+    (log-line "WARNING: no surface is live (transports=~s; pp needs [pp] enabled=true and base) — idling with nothing to serve"
+              *transports*))
   ;; restore anything queued when a previous run died (see queue-sync)
   (setf *queue* (getf *state* :queue))
   ;; NOTE: reap AFTER connecting. reap-orphan may wait on an in-flight turn,
@@ -2196,40 +2223,49 @@ in-memory-only queue (lost DM observed 2026-10-09 ~06:50)."
       ;; serious-condition (stack/heap exhaustion is a storage-condition, NOT
       ;; an error) so a bad parse cannot abort the process.
       (block reconnect
-      (handler-case (progn (xmpp-connect) (setf backoff 5)
-                           (reap-orphan))
-        (serious-condition (e)
+      (when *xmpp-on*
+        (handler-case (progn (xmpp-connect) (setf backoff 5))
+          (serious-condition (e)
             (log-line "connect failed: ~a — retry in ~ds" e backoff)
             (kill-transport)
             (setf *conn* nil)
             (sleep backoff)
             (setf backoff (min (* 2 backoff) 60))
-            (return-from reconnect nil)))
+            (return-from reconnect nil))))
+      ;; reap runs once per outer-loop pass: after a connect when xmpp is
+      ;; on, and immediately when it is off (there is no stream to starve).
+      (reap-orphan)
       ;; serve until the stream dies
       (handler-case
           (progn
             (loop
-              ;; 1. drain + dispatch xmpp stanzas (up to ~0.5s granularity)
-              (let ((stanza (xmpp-next-stanza-with-timeout)))
-                (when stanza (dispatch-stanza stanza)))
+              ;; 1. drain + dispatch xmpp stanzas (up to ~0.5s granularity).
+              ;; This step is also the loop's only natural pace: with xmpp off
+              ;; there is no blocking read, so the pp-poller branch below
+              ;; sleeps explicitly. A pp-only bridge that fell through without
+              ;; either would hot-spin a core.
+              (if *xmpp-on*
+                  (let ((stanza (xmpp-next-stanza-with-timeout)))
+                    (when stanza (dispatch-stanza stanza)))
+                  (sleep 0.5))
               ;; 2. keepalive whitespace ping every 60s
-              (when (> (- (now) *main-last-keepalive*) 60)
+              (when (and *xmpp-on* (> (- (now) *main-last-keepalive*) 60))
                 (setf *main-last-keepalive* (now))
                 (xmpp-send " "))
               ;; 2b. XEP-0199 ping every *xmpp-ping-secs*: forces a
               ;; round-trip answer (pong or error iq) even when idle, so
               ;; *last-inbound* stays fresh on a healthy stream.
-              (when (> (- (now) *main-last-xmpp-ping*) *xmpp-ping-secs*)
+              (when (and *xmpp-on* (> (- (now) *main-last-xmpp-ping*) *xmpp-ping-secs*))
                 (setf *main-last-xmpp-ping* (now))
                 (xmpp-send (format nil "<iq id='keepalive~d' type='get'><ping xmlns='urn:xmpp:ping'/></iq>" (now))))
               ;; 2c. no inbound bytes for *xmpp-stale-secs* — not even
               ;; ping answers: the flow is dead (silently dropped
               ;; middlebox state). Raise through the normal error path
               ;; below, which closes the tunnel and reconnects.
-              (when (> (- (now) *last-inbound*) *xmpp-stale-secs*)
+              (when (and *xmpp-on* (> (- (now) *last-inbound*) *xmpp-stale-secs*))
                 (error "xmpp stale: no inbound bytes in ~as — reconnecting" *xmpp-stale-secs*))
               ;; 2d. MUC self-heal: fire any due room rejoin (*muc-rejoin*)
-              (muc-rejoin-due)
+              (when *xmpp-on* (muc-rejoin-due))
               ;; 3. start a queued turn if none is running
               (when (and *queue* (not *turn*))
                 (let ((item (first *queue*)))
