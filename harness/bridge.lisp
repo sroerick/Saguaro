@@ -599,6 +599,12 @@ put it in /usr/local/bin, Linux in /usr/bin)."
   (ignore-errors
    (pp-eval (format nil "(inbox/add ~a \"dm\" ~a)"
                     (pp-lisp-str "gregor") (pp-lisp-str text)))))
+                      ;; the row is AUTHOR-attributed: inbox/add is
+                      ;; (lambda (from kind body)) over one shared journal
+                      ;; with per-user read cursors - the inbound mirror
+                      ;; (:2128) files with author=frm, this outbound with
+                      ;; author=gregor. by design; if this bridge ever
+                      ;; serves a second identity, lift gregor to config.
 
 (defun pp-say-with-retry (peer text &optional (attempts 4))
   "Retry with backoff. Returns t on success; on final failure the caller
