@@ -2190,6 +2190,10 @@ in-memory-only queue (lost DM observed 2026-10-09 ~06:50)."
 (defparameter *main-last-flush* 0)
 (defparameter *main-last-task-poll* 0)
 (defparameter *main-last-xmpp-ping* 0)
+;; When xmpp is enabled but the stream is down while pp keeps serving, the
+;; outer loop is already inside the serve pass, so the connect block will not
+;; be revisited on its own. This timestamp gates the re-attempt.
+(defparameter *main-next-xmpp-try* 0)
 ;; Last time ANY byte arrived from the xmpp tunnel — stanza, pong, or
 ;; whitespace — refreshed by every read path. A stream with no inbound
 ;; bytes for *xmpp-stale-secs* is dead even if TCP still says
@@ -2229,12 +2233,20 @@ in-memory-only queue (lost DM observed 2026-10-09 ~06:50)."
             (log-line "connect failed: ~a — retry in ~ds" e backoff)
             (kill-transport)
             (setf *conn* nil)
-            (sleep backoff)
-            (setf backoff (min (* 2 backoff) 60))
-            (return-from reconnect nil))))
+            ;; Do NOT abandon the loop while pp can still serve. An xmpp-only
+            ;; bridge skips the serve pass and retries; a DUAL bridge keeps
+            ;; polling the habitat while xmpp retries in the background.
+            (unless *pp-on*
+              (sleep backoff)
+              (setf backoff (min (* 2 backoff) 60))
+              (return-from reconnect nil))
+            (setf *main-next-xmpp-try* (+ (now) backoff))
+            (setf backoff (min (* 2 backoff) 60)))))
       ;; reap runs once per outer-loop pass: after a connect when xmpp is
       ;; on, and immediately when it is off (there is no stream to starve).
-      (reap-orphan)
+      ;; While xmpp is DOWN but pp is serving, skip it: reap-orphan may wait
+      ;; on an in-flight turn, which would stall the habitat poller.
+      (when (or (not *xmpp-on*) *conn*) (reap-orphan))
       ;; serve until the stream dies
       (handler-case
           (progn
@@ -2244,28 +2256,35 @@ in-memory-only queue (lost DM observed 2026-10-09 ~06:50)."
               ;; there is no blocking read, so the pp-poller branch below
               ;; sleeps explicitly. A pp-only bridge that fell through without
               ;; either would hot-spin a core.
-              (if *xmpp-on*
-                  (let ((stanza (xmpp-next-stanza-with-timeout)))
-                    (when stanza (dispatch-stanza stanza)))
-                  (sleep 0.5))
+              (cond ((and *xmpp-on* *conn*)
+                     (let ((stanza (xmpp-next-stanza-with-timeout)))
+                       (when stanza (dispatch-stanza stanza))))
+                    (t (sleep 0.5)))
               ;; 2. keepalive whitespace ping every 60s
-              (when (and *xmpp-on* (> (- (now) *main-last-keepalive*) 60))
+              (when (and *xmpp-on* *conn* (> (- (now) *main-last-keepalive*) 60))
                 (setf *main-last-keepalive* (now))
                 (xmpp-send " "))
               ;; 2b. XEP-0199 ping every *xmpp-ping-secs*: forces a
               ;; round-trip answer (pong or error iq) even when idle, so
               ;; *last-inbound* stays fresh on a healthy stream.
-              (when (and *xmpp-on* (> (- (now) *main-last-xmpp-ping*) *xmpp-ping-secs*))
+              (when (and *xmpp-on* *conn* (> (- (now) *main-last-xmpp-ping*) *xmpp-ping-secs*))
                 (setf *main-last-xmpp-ping* (now))
                 (xmpp-send (format nil "<iq id='keepalive~d' type='get'><ping xmlns='urn:xmpp:ping'/></iq>" (now))))
               ;; 2c. no inbound bytes for *xmpp-stale-secs* — not even
               ;; ping answers: the flow is dead (silently dropped
               ;; middlebox state). Raise through the normal error path
               ;; below, which closes the tunnel and reconnects.
-              (when (and *xmpp-on* (> (- (now) *last-inbound*) *xmpp-stale-secs*))
+              (when (and *xmpp-on* *conn* (> (- (now) *last-inbound*) *xmpp-stale-secs*))
                 (error "xmpp stale: no inbound bytes in ~as — reconnecting" *xmpp-stale-secs*))
               ;; 2d. MUC self-heal: fire any due room rejoin (*muc-rejoin*)
-              (when *xmpp-on* (muc-rejoin-due))
+              (when (and *xmpp-on* *conn*) (muc-rejoin-due))
+              ;; 2e. xmpp enabled but disconnected — connect failed, or the
+              ;; stream died while pp kept serving. Once the backoff has
+              ;; elapsed, raise through the normal error path so the connect
+              ;; block retries. Without this, a dual bridge that lost xmpp
+              ;; would never re-attempt the stream.
+              (when (and *xmpp-on* (null *conn*) (>= (now) *main-next-xmpp-try*))
+                (error "xmpp reconnect due"))
               ;; 3. start a queued turn if none is running
               (when (and *queue* (not *turn*))
                 (let ((item (first *queue*)))
@@ -2311,7 +2330,13 @@ in-memory-only queue (lost DM observed 2026-10-09 ~06:50)."
           (log-line "main loop error: ~a — reconnecting in ~ds" e backoff)
             (kill-transport)
             (setf *conn* nil)
-          (sleep backoff)
+          ;; Sleeping here is correct for an xmpp-only bridge (nothing else to
+          ;; do). For a dual bridge it would starve the habitat poller for up
+          ;; to 60s per failed reconnect, so park the retry time and let the
+          ;; serve pass keep running pp while xmpp waits out the backoff.
+          (if *pp-on*
+              (setf *main-next-xmpp-try* (+ (now) backoff))
+              (sleep backoff))
           (setf backoff (min (* 2 backoff) 60))))))))
 
 (defun xmpp-next-stanza-with-timeout ()
