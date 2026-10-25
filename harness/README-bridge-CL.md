@@ -15,6 +15,37 @@ External contracts are unchanged, so `watchdog.py` / `canary.py` /
 `harness/bridge.log`, config `harness/config.toml`, turn marker
 `~/.cache/saguaro-turn-active`.
 
+## Transports — pp is the default, xmpp is opt-in (2026-10-25)
+
+`[bridge] transports` decides which surfaces the bridge serves:
+
+```toml
+[bridge]
+transports = ["pp"]            # default: habitat DM only
+transports = ["pp", "xmpp"]   # both (each still needs its own switch)
+transports = ["xmpp"]         # XMPP only, the pre-2026-10 behavior
+```
+
+A listed surface still needs its own switch to run: `[pp] enabled = true` plus
+`base`, or `[bridge] jid` / `password_file` / `mucs`.
+
+Why this knob exists: `xmpp-connect` used to sit in FRONT of the whole main
+loop, with the pp poller as step 5 INSIDE it. So an unreachable, unconfigured,
+or merely quiet XMPP stream meant pp-dm was **never polled** — the inbound
+liveness watchdog (`xmpp_stale_secs`, default 2700) would raise and tear down
+the entire loop, taking the habitat surface with it. The transport ranking was
+an accident of loop nesting, not a decision.
+
+Now, with `xmpp` unselected: no `openssl s_client` tunnel is spawned, no JID or
+password is read, no rooms are joined, no keepalive/ping/stale checks run, and
+the loop paces itself with an explicit `(sleep 0.5)` in place of the blocking
+stanza read. Measured: 0 CPU ticks over 5s wall with pp unreachable, so a
+pp-only bridge idles instead of hot-spinning.
+
+The turn engine was already transport-agnostic (`deliver-once` dispatches on
+`:pp-dm` / `:xmpp-private` / `:xmpp-group`, reply policy is per-surface), so
+this only had to gate `main()`.
+
 ## Senders (say.lisp, 2026-10-09)
 
 One-shot dm/muc/history tools for the agent's hands, reusing this file's

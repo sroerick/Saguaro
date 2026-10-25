@@ -1,6 +1,17 @@
 # Copy to config.toml (chmod 600) and fill in. Never commit the real one.
 
 [bridge]
+# Which surfaces this bridge serves. Default: ["pp"] — the habitat DM is
+# the transport; XMPP is OPT-IN (add "xmpp" and fill in jid/
+# password_file/mucs below). XMPP carries an openssl TLS tunnel, room
+# joins and an inbound-liveness watchdog, and none of that can take the
+# habitat surface down when it is not selected.
+#   ["pp"]          habitat DM only (default)
+#   ["pp", "xmpp"]  both; each still needs its own switch to run
+#   ["xmpp"]        XMPP only (the pre-2026-10 behavior)
+# A listed surface still needs [pp] enabled=true + base, or [bridge] jid.
+transports = ["pp"]
+
 jid = "agent@chat.example.net"
 password_file = "/home/agent/saguaro/harness/xmpp.password"   # one line, 0600
 allow = ["owner@chat.example.net"]        # 1:1 senders the bridge obeys
