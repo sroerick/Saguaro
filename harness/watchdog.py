@@ -175,16 +175,62 @@ def sh(cmd, timeout=90):
     return subprocess.CompletedProcess(cmd, 127, "", "probe failed")
 
 
+# --- probe bootstrap failure (added 2026-10-28) -----------------------------
+# 2026-10-28: the web console now runs inside this image (init.lisp awui hook)
+# and fetches its data by shelling out to the CLI. Every autolith invocation
+# maps a 1.5 GiB dynamic space, so on this 4 GiB box a probe can die on the way
+# up under memory pressure:
+#   RUNTIME WARNING: data size resource limit may be too low ...
+#   mmap: Cannot allocate memory
+#   fatal error encountered in SBCL pid N: Can not allocate 0x60000000 bytes
+# A probe that never got as far as answering is not evidence that the session
+# is gone - the same rule as a fork failure above. Without this guard the
+# watchdog killed a healthy agent whenever the console was open (incident
+# bundles 20261028-04*/05*-recover.log).
+BOOTSTRAP_FAILURE_MARKERS = (
+    "fatal error encountered in SBCL",
+    "Cannot allocate 0x",
+    "mmap: Cannot allocate memory",
+    "Heap exhausted during garbage collection",
+    "data size resource limit may be too low",
+)
+
+
+def probe_bootstrap_failure():
+    """Rerun the status probe with stderr in hand, only when it reported no
+    session. True means the CLI died before it could answer (resource
+    starvation), so this cycle must not repair anything."""
+    try:
+        p = subprocess.run([A["bin"], "localgroup", "status", "--sexp"],
+                           capture_output=True, text=True, timeout=90)
+    except OSError as e:
+        _note_probe_failure("%s running localgroup status" % (e,))
+        return False
+    if p.returncode == 0:
+        return False
+    blob = "%s%s" % (p.stdout or "", p.stderr or "")
+    for marker in BOOTSTRAP_FAILURE_MARKERS:
+        if marker in blob:
+            print("watchdog: status probe died at bootstrap: %s"
+                  % blob.strip().splitlines()[-1], flush=True)
+            return True
+    return False
+
+
 def agent_status():
-    """Session records from `localgroup status`.
+    """Session records from the CLI status probe.
 
     [] means the CLI RAN and reported no session (a real outage -> repair).
     StatusUnknown means the probe could not run at all -> never repair."""
     try:
-        return bridge.status_records()
+        recs = bridge.status_records()
     except Exception as e:
         print("watchdog: status failed: %s" % e, flush=True)
         raise StatusUnknown("%s: %s" % (e.__class__.__name__, e))
+    if not recs and probe_bootstrap_failure():
+        raise StatusUnknown("status probe died at SBCL bootstrap "
+                            "(resource starvation, not a dead session)")
+    return recs
 
 
 def status_confirmed():
