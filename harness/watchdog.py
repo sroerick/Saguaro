@@ -393,10 +393,15 @@ def incident(kind, note):
         here = Path(__file__).resolve().parent
         stamp = time.strftime("%Y%m%d-%H%M%S")
         out = ["=== incident %s (%s) ===" % (stamp, kind), note, ""]
-        cap = sh(["/usr/bin/tmux", "capture-pane", "-p", "-S", "-300",
-                  "-t", "xmpp-bridge"], timeout=20)
-        out.append("--- tmux pane (tail) ---")
-        out.append(cap.stdout or "(no pane output / session gone)")
+        # Capture BOTH panes. Only xmpp-bridge was captured before, so an
+        # agent death left no agent-side evidence at all (2026-10-30: the
+        # bridge died of heap exhaustion and the agent went with it, and the
+        # incident bundle showed nothing but bridge log lines).
+        for pane in ("alagent", "xmpp-bridge"):
+            cap = sh(["/usr/bin/tmux", "capture-pane", "-p", "-S", "-300",
+                      "-t", pane], timeout=20)
+            out.append("--- tmux pane %s (tail) ---" % pane)
+            out.append(cap.stdout or "(no pane output / session gone)")
         err = here / "bridge.err"
         if err.exists():
             lines = err.read_text(errors="replace").splitlines()[-200:]
