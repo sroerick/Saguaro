@@ -647,7 +647,10 @@ parks the text so it is retried later, never dropped."
 ;; INTERVALS, so it is not a real time bound; this is. Deliberately generous:
 ;; real turns run 30-60+ min (see header) and completion is detected by the
 ;; app reporting it is no longer in a turn (below), not by this number.
-(defparameter *al-turn-wall-cap* (cfg-int "autolith" "turn_max_secs" 5400))
+(defparameter *al-turn-wall-cap*
+  ;; default to the configured hard cap, never below it: local config sets
+  ;; turn_timeout_secs = 14400 and real turns run 30-60+ min.
+  (cfg-int "autolith" "turn_max_secs" *al-hard-cap*))
 (defparameter *al-settle-secs* (cfg-int "autolith" "settle_secs" 5))
 (defparameter *al-start-timeout* (cfg-int "autolith" "start_timeout_secs" 120))
 
