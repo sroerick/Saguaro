@@ -598,7 +598,7 @@ put it in /usr/local/bin, Linux in /usr/bin)."
                      (pp-lisp-str peer) (pp-lisp-str part))))
   (ignore-errors
    (pp-eval (format nil "(inbox/add ~a \"dm\" ~a)"
-                    (pp-lisp-str "gregor") (pp-lisp-str text)))))
+                    (pp-lisp-str (cfg-str "pp" "user" "gregor")) (pp-lisp-str text)))))
                       ;; the row is AUTHOR-attributed: inbox/add is
                       ;; (lambda (from kind body)) over one shared journal
                       ;; with per-user read cursors - the inbound mirror
@@ -619,8 +619,19 @@ parks the text so it is retried later, never dropped."
                  (sleep (* 5 (1+ attempt))))))))
 
 ;;; the same poll expression bridge.py used (chat lib, all DM rooms)
-(defparameter *pp-poll-expr*
+(defparameter *pp-poll-expr-2arg*
+  "(let* ((me (as-str (whoami))) (rooms (chat/dms))) (let ((parts (list/foldl (lambda (acc rk) (let* ((room (dict-get rooms rk)) (rid (as-str (dict-get room \"room_id\"))) (peer (chat/dm-peer-from-title (dict-get room \"title\") me)) (rows (chat/history rid 200)) (rj (list/foldl (lambda (a rk2) (let* ((row (dict-get rows rk2)) (item (dict-set* \"{}\" (list \"id\" rk2 \"from\" (as-str (dict-get row \"from\")) \"at\" (as-str (dict-get row \"created_at\")) \"body\" (as-str (dict-get row \"body\")))))) (string-append a (if (string-eq a \"\") \"\" \",\") item))) \"\" (dict-keys rows)))) (string-append acc (if (string-eq acc \"\") \"\" \",\") (dict-set* \"{}\" (list \"room\" rid \"peer\" peer \"rows\" (string-append \"[\" rj \"]\")))))) \"\" (dict-keys rooms)))) (dict-set* \"{}\" (list \"rooms\" (string-append \"[\" parts \"]\")))))")
+
+;; Kept as a fallback: the pp kernel's chat/history signature changed under a
+;; running bridge on 2026-10-30 (room -> room+limit) and the poll expression
+;; started failing with "arity mismatch", which silently dropped every DM for
+;; a day. Either shape is now selectable; see the error handler in pp-poll.
+(defparameter *pp-poll-expr-1arg*
   "(let ((me (as-str (whoami)))) (let ((parts (list/foldl (lambda (acc room) (let* ((rf (chat/row-fields room)) (rid (chat/room-id-of rf)) (peer (chat/dm-peer-from-title (dict-get rf \"title\") me)) (rows (chat/history rid))) (let ((rj (list/foldl (lambda (a row) (let ((f (chat/row-fields row))) (string-append a (if (string-eq a \"\") \"\" \",\") (dict-set* \"{}\" (list \"id\" (chat/row-id row) \"from\" (chat/msg-from f) \"at\" (as-str (dict-get f \"created_at\")) \"body\" (chat/msg-body f)))))) \"\" rows))) (string-append acc (if (string-eq acc \"\") \"\" \",\") (dict-set* \"{}\" (list \"room\" rid \"peer\" peer \"rows\" (string-append \"[\" rj \"]\"))))))) \"\" (chat/dms)))) (dict-set* \"{}\" (list \"rooms\" (string-append \"[\" parts \"]\")))))")
+
+(defparameter *pp-poll-expr* *pp-poll-expr-2arg*)
+(defparameter *pp-poll-expr-choice* :2arg)
+(defparameter *pp-poll-last-flip* 0)
 
 ;;; ---------------------------------------------------------------------
 ;;; autolith control
@@ -632,6 +643,11 @@ parks the text so it is retried later, never dropped."
 (defparameter *al-conv* (cfg-str "autolith" "conv"))
 (defparameter *al-max-reply-chars* (cfg-int "autolith" "max_reply_chars" 8000))
 (defparameter *al-hard-cap* (cfg-int "autolith" "turn_timeout_secs" 900))
+;; Wall-clock ceiling for one turn. The `waited` counter above accrues poll
+;; INTERVALS, so it is not a real time bound; this is. Deliberately generous:
+;; real turns run 30-60+ min (see header) and completion is detected by the
+;; app reporting it is no longer in a turn (below), not by this number.
+(defparameter *al-turn-wall-cap* (cfg-int "autolith" "turn_max_secs" 5400))
 (defparameter *al-settle-secs* (cfg-int "autolith" "settle_secs" 5))
 (defparameter *al-start-timeout* (cfg-int "autolith" "start_timeout_secs" 120))
 
@@ -677,7 +693,9 @@ parks the text so it is retried later, never dropped."
                             :conversation (kid-val form :conversation-id)
                             :pid (kid-val form :pid)
                             :idle (truthy-p (kid-val form :idle-p))
-                            :active (truthy-p (kid-val form :active-turn-p)))))))
+                            :active (truthy-p (kid-val form :active-turn-p))
+                            :waiting (truthy-p
+                                      (kid-val form :waiting-for-input-p)))))))
 
 (defun kid-val (form key)
   "Keyword-arg value in a (:type :key val ...) form. Walks keyword/value
@@ -1067,7 +1085,8 @@ only guarded against a mid-turn idle blip; that is handled instead by
 checking, after the settle, whether the turn actually produced content (see
 collect-turn-records), which retries briefly rather than stalling everyone."
   (let ((waited 0) (started nil) (last-size (conv-total-size))
-        (last-activity (now)) (last-typing 0))
+        (last-activity (now)) (last-typing 0)
+        (turn-start (now)))
     (loop
       (sleep *al-poll-secs*)
       (incf waited *al-poll-secs*)
@@ -1093,12 +1112,29 @@ collect-turn-records), which retries briefly rather than stalling everyone."
         (let ((size (conv-total-size)))
           (when (> size last-size)
             (setf last-size size started t last-activity (now))))
-        (when (and started cur (getf cur :idle) (not (getf cur :active))
-                   (>= (- (now) last-activity) *al-settle-secs*))
+        ;; Finished when the app is out of a turn: :IDLE-P alone is not
+        ;; enough, because background child tasks keep :IDLE-P NIL while the
+        ;; composer is already accepting input (2026-10-30: 5 live swarm
+        ;; children held a finished turn open for 35+ min and starved the
+        ;; DM queue behind it).
+        ;; :WAITING-FOR-INPUT-P is authoritative: the composer is accepting
+        ;; input, so no turn is open. Do NOT also require the settle window --
+        ;; live child tasks keep appending records, which refreshes
+        ;; last-activity forever and defeated the settle test (2026-10-30: a
+        ;; finished turn stayed "in flight" for 35+ minutes).
+        (when (and started cur (not (getf cur :active))
+                   (or (getf cur :waiting)
+                       (and (getf cur :idle)
+                            (>= (- (now) last-activity) *al-settle-secs*))))
           (return :done))
         (when (and (not started) (> waited *al-start-timeout*))
           (return :never-started))
-        (when (> waited *al-hard-cap*)
+        ;; `waited` counts poll INTERVALS, not seconds: a slow status poll
+        ;; stretched a nominal 900s cap past 30 minutes (2026-10-30, held the
+        ;; queue behind a turn that the app had already finished). Cap on
+        ;; wall clock too.
+        (when (or (> waited *al-hard-cap*)
+                  (> (- (now) turn-start) *al-turn-wall-cap*))
           (return :timeout))))))
 
 (defun cap-reply (text)
@@ -2094,6 +2130,29 @@ in-memory-only queue (lost DM observed 2026-10-09 ~06:50)."
 (defparameter *pp-primed* nil)
 (defparameter *pp-libs-loaded* nil)
 (defparameter *pp-pending* (make-hash-table :test 'equal)) ; peer -> bodies
+(defparameter *pp-cursor-file* "/home/al/saguaro-live/harness/pp-dm-cursors.sexp")
+
+(defun pp-load-cursors ()
+  "Restore per-room newest-at cursors saved by a previous bridge life."
+  (ignore-errors
+   (with-open-file (in *pp-cursor-file* :if-does-not-exist nil)
+     (when in
+       (let ((alist (read in nil nil)))
+         (dolist (kv alist)
+           (setf (gethash (car kv) *pp-cursors*) (cdr kv))))))))
+
+(defun pp-save-cursors ()
+  "Persist per-room newest-at cursors (atomic tmp+rename)."
+  (ignore-errors
+   (let ((tmp (concatenate 'string *pp-cursor-file* ".tmp")))
+     (with-open-file (out tmp :direction :output :if-exists :supersede)
+       (prin1 (let ((acc ()))
+                (maphash (lambda (k v) (push (cons k v) acc)) *pp-cursors*)
+                acc)
+              out))
+     (rename-file tmp *pp-cursor-file*))))
+
+(pp-load-cursors)
 
 (defun pp-poll ()
   (handler-case
@@ -2134,8 +2193,10 @@ in-memory-only queue (lost DM observed 2026-10-09 ~06:50)."
                          (pp-eval (format nil "(inbox/add ~a \"reply\" ~a)"
                                           (pp-lisp-str frm)
                                           (pp-lisp-str body)))))))
-                (setf (gethash rid *pp-cursors*) newest))))
+                  (when (plusp (length newest))
+                    (setf (gethash rid *pp-cursors*) newest)))))
           (setf *pp-primed* t))
+          (pp-save-cursors)
         ;; launch one turn per pending peer when no turn is running
         (unless *turn*
           (loop for peer being the hash-keys of *pp-pending*
@@ -2148,6 +2209,18 @@ in-memory-only queue (lost DM observed 2026-10-09 ~06:50)."
       (let ((msg (format nil "~a" e)))
         (when (search "unbound" msg)
           (setf *pp-libs-loaded* nil))
+        ;; A pp-side signature change must not blackhole DMs: flip to the other
+        ;; expression shape (at most once every 5 minutes, so two wrong shapes
+        ;; cannot flap).
+        (when (and (search "arity mismatch" msg)
+                   (> (- (now) *pp-poll-last-flip*) 300))
+          (setf *pp-poll-last-flip* (now)
+                *pp-poll-expr* (if (eq *pp-poll-expr-choice* :2arg)
+                                   *pp-poll-expr-1arg* *pp-poll-expr-2arg*)
+                *pp-poll-expr-choice* (if (eq *pp-poll-expr-choice* :2arg)
+                                          :1arg :2arg))
+          (log-line "pp poll expr -> ~a (pp signature changed: ~a)"
+                    *pp-poll-expr-choice* msg))
         (log-line "pp dm poll error: ~a" msg)))))
 
 (defun run-pp-turn (peer bodies)
@@ -2327,6 +2400,11 @@ in-memory-only queue (lost DM observed 2026-10-09 ~06:50)."
               (when (> (- (now) *main-last-task-poll*) *task-poll-secs*)
                 (setf *main-last-task-poll* (now))
                 (ignore-errors (sync-tasks)))
+              ;; 6c. deliver buffered job notices as one digest
+              (when (and *notice-digest* *notice-digest-since*
+                         (> (- (now) *notice-digest-since*)
+                            *notice-digest-window*))
+                (ignore-errors (flush-notices)))
               ;; 7. retry parked deliveries
               (when (getf *state* :parked)
                 (when (> (- (now) *main-last-flush*) 30)
@@ -2518,11 +2596,59 @@ instead of returning nil, which would have spun silently forever.)"
             (text (format nil "background job finished: ~a~%~a"
                           (task-headline form) (task-body form))))
         (log-line "child job ~a finished -> ~a" child peer)
-        (if (deliver-notice peer surface text)
-            (log-line "announced child job ~a to ~a" child peer)
-            (park-pending peer surface text))
+        (queue-notice peer surface text)
+        (log-line "queued child job notice ~a to ~a" child peer)
         (setf (getf (cdr task) :delivered) t)
         (save-state)))))
+
+
+;;; ---------------------------------------------------------------------
+;;; notice digest: a fan-out must not become N instant messages
+;;; ---------------------------------------------------------------------
+;; 2026-10-30: a SWARM fan-out of ~25 children, most of which died within
+;; five seconds, produced 25 private messages in three seconds. Buffer
+;; finished-job notices and deliver one digest per (peer, surface).
+(defparameter *notice-digest* nil)        ; list of (peer surface text), newest first
+(defparameter *notice-digest-since* nil)
+(defparameter *notice-digest-window* 45)  ; seconds a lone notice may wait
+(defparameter *notice-digest-max* 8)      ; flush early at this many
+(defparameter *notice-digest-chars* 6000) ; hard cap on one digest body
+
+(defun queue-notice (peer surface text)
+  (when (null *notice-digest*) (setf *notice-digest-since* (now)))
+  (push (list peer surface text) *notice-digest*)
+  (when (>= (length *notice-digest*) *notice-digest-max*)
+    (flush-notices)))
+
+(defun flush-notices ()
+  (when *notice-digest*
+    (let ((batch (nreverse *notice-digest*)))
+      (setf *notice-digest* nil *notice-digest-since* nil)
+      (let ((groups ()))
+        (dolist (item batch)
+          (let* ((key (list (first item) (second item)))
+                 (cell (assoc key groups :test #'equal)))
+            (if cell
+                (setf (cdr cell) (append (cdr cell) (list (third item))))
+                (push (cons key (list (third item))) groups))))
+        (dolist (cell groups)
+          (let* ((key (car cell))
+                 (texts (cdr cell))
+                 (peer (first key))
+                 (surface (second key))
+                 (header (if (= (length texts) 1)
+                             "background job finished:"
+                             (format nil "~d background jobs finished:"
+                                     (length texts))))
+                 (body (format nil "~{~a~^~%~}" texts)))
+            (when (> (length body) *notice-digest-chars*)
+              (setf body (concatenate 'string
+                                      (subseq body 0 *notice-digest-chars*)
+                                      "...[truncated]")))
+            (let ((text (format nil "~a~%~a" header body)))
+              (log-line "notice digest: ~d job(s) -> ~a" (length texts) peer)
+              (unless (deliver-notice peer surface text)
+                (park-pending peer surface text)))))))))
 
 (defun sync-tasks ()
   "Adopt new children, then announce any that finished. A child seen while a
