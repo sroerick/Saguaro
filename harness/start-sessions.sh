@@ -144,7 +144,10 @@ else
   # (records-for-file now PRUNES consumed records; the retained set stays
   # small), so the bridge is back on the DEFAULT heap. If it ever needs more:
   # al's login-class datasize cap is 1536M (>=1408M fails to allocate).
-  BRIDGE_CMD="sbcl --script $DIR/bridge.lisp 2>>$DIR/bridge.err"
+  # 2026-10-30: the default 805MB dynamic space was exhausted while
+  # collecting a turn on a 93MB conversation. Parsing is now incremental
+  # (rescan touches only the newest chunks), but keep headroom.
+  BRIDGE_CMD="sbcl --dynamic-space-size 1024 --script $DIR/bridge.lisp 2>>$DIR/bridge.err"
   BRIDGE_PAT="bridge.lisp"
 fi
 
