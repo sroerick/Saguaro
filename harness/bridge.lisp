@@ -620,7 +620,7 @@ parks the text so it is retried later, never dropped."
 
 ;;; the same poll expression bridge.py used (chat lib, all DM rooms)
 (defparameter *pp-poll-expr-2arg*
-  "(let* ((me (as-str (whoami))) (rooms (chat/dms))) (let ((parts (list/foldl (lambda (acc rk) (let* ((room (dict-get rooms rk)) (rid (as-str (dict-get room \"room_id\"))) (peer (chat/dm-peer-from-title (dict-get room \"title\") me)) (rows (chat/history rid 200)) (rj (list/foldl (lambda (a rk2) (let* ((row (dict-get rows rk2)) (item (dict-set* \"{}\" (list \"id\" rk2 \"from\" (as-str (dict-get row \"from\")) \"at\" (as-str (dict-get row \"created_at\")) \"body\" (as-str (dict-get row \"body\")))))) (string-append a (if (string-eq a \"\") \"\" \",\") item))) \"\" (dict-keys rows)))) (string-append acc (if (string-eq acc \"\") \"\" \",\") (dict-set* \"{}\" (list \"room\" rid \"peer\" peer \"rows\" (string-append \"[\" rj \"]\")))))) \"\" (dict-keys rooms)))) (dict-set* \"{}\" (list \"rooms\" (string-append \"[\" parts \"]\")))))")
+  "(let* ((me (as-str (whoami))) (rooms (chat/dms))) (let ((parts (list/foldl (lambda (acc rk) (let* ((room (dict-get rooms rk)) (rid (as-str (dict-get room \"room_id\"))) (peer (chat/dm-peer-from-title (dict-get room \"title\") me)) (rows (chat/history rid 50)) (rj (list/foldl (lambda (a rk2) (let* ((row (dict-get rows rk2)) (item (dict-set* \"{}\" (list \"id\" rk2 \"from\" (as-str (dict-get row \"from\")) \"at\" (as-str (dict-get row \"created_at\")) \"body\" (as-str (dict-get row \"body\")))))) (string-append a (if (string-eq a \"\") \"\" \",\") item))) \"\" (dict-keys rows)))) (string-append acc (if (string-eq acc \"\") \"\" \",\") (dict-set* \"{}\" (list \"room\" rid \"peer\" peer \"rows\" (string-append \"[\" rj \"]\")))))) \"\" (dict-keys rooms)))) (dict-set* \"{}\" (list \"rooms\" (string-append \"[\" parts \"]\")))))")
 
 ;; Kept as a fallback: the pp kernel's chat/history signature changed under a
 ;; running bridge on 2026-10-30 (room -> room+limit) and the poll expression
@@ -905,8 +905,16 @@ parks the text so it is retried later, never dropped."
    turn's records can land in a file the incremental cache has already read
    past. Memory is bounded instead by records-for-file PRUNING consumed
    records, so the cache never retains the whole conversation."
-  (dolist (p (conv-files))
-    (remhash (namestring p) *file-cache*)))
+  ;; Only the NEWEST chunk(s) can still be appended to. Dropping the cache for
+  ;; every file made turn end re-parse the whole conversation from byte 0: 46
+  ;; chunks / 93 MB -> ~800 MB of Lisp objects, which exhausted SBCL's dynamic
+  ;; space inside collect-turn-records and killed the bridge (2026-10-30 14:49,
+  ;; "Heap exhausted, game over", 82% of 805 MB). Two newest, for rotation
+  ;; slack.
+  (let* ((files (conv-files))
+         (tail (if (> (length files) 2) (last files 2) files)))
+    (dolist (p tail)
+      (remhash (namestring p) *file-cache*))))
 
 (defun advance-watermarks (new-records)
   (dolist (item new-records)
