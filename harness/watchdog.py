@@ -36,6 +36,7 @@ Silent exit when everything is healthy.
 import os
 import re
 import subprocess
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -73,6 +74,17 @@ TURN_DEFER_SECS = float(A.get("turn_timeout_secs", 900)) + 600
 NO_TEXT_MARK = Path.home() / ".cache" / "saguaro-no-text-turn"
 NO_TEXT_ALERTED = Path.home() / ".cache" / "saguaro-no-text-alerted"
 NO_TEXT_MAX_AGE = 7200  # ignore a marker older than this (stale)
+
+# --- disk guard (added 2026-11-10) -----------------------------------------
+# 2026-11-10: / hit 101% (-18K free) and took the agent AND the bridge down:
+# the bridge logged 28x "No space left on device", the image could not boot or
+# log, and this watchdog's own restart could not write. Every factory job
+# leaves a 1.5-3G dune _build behind and nothing pruned them, so the first
+# symptom was a canary FAIL 75 minutes later. Disk is upstream of every other
+# failure, so the guard runs FIRST in the cycle, before any repair attempt.
+DISK_GUARD = str(Path(__file__).resolve().parent / "scripts" / "disk-guard.sh")
+DISK_ALERTED = Path.home() / ".cache" / "saguaro-disk-alerted"
+DISK_ALERT_GAP = 3600  # do not page about the disk more than once an hour
 
 # --- crash-loop breaker (added 2026-10-16) ----------------------------------
 # Repeated auto-repairs can amplify a crash (openclaw's lesson: 3 unclean
@@ -217,6 +229,79 @@ def probe_bootstrap_failure():
     return False
 
 
+REGISTRY_DIR = Path.home() / ".local" / "state" / "autolith" / "localgroup"
+REGISTRY_BACKUP = Path.home() / ".cache" / "saguaro-endpoint-backup"
+
+
+def live_image_pids():
+    """PIDs of the running Autolith images on this box."""
+    p = sh(["/usr/bin/pgrep", "-f", "autolith-active.core"])
+    return set((p.stdout or "").split())
+
+
+def snapshot_endpoint_records():
+    """Keep a copy of every live localgroup registry record.
+
+    Autolith's client deletes a record on ANY query error
+    (localgroup-query-record -> localgroup--remove-stale-record), so one
+    transient error while the agent is busy permanently unpublishes a healthy
+    session. The record is just a discovery file (pid/port/token), so a copy
+    restored while the SAME image pid is alive brings the session back with no
+    restart (2026-11-04 incident)."""
+    try:
+        if not REGISTRY_DIR.is_dir():
+            return
+        REGISTRY_BACKUP.mkdir(parents=True, exist_ok=True)
+        for f in REGISTRY_DIR.glob("*.sexp"):
+            try:
+                shutil.copy2(str(f), str(REGISTRY_BACKUP / f.name))
+            except OSError as e:
+                print("watchdog: endpoint snapshot failed for %s: %s" % (f, e),
+                      flush=True)
+    except OSError as e:
+        print("watchdog: endpoint snapshot failed: %s" % e, flush=True)
+
+
+def restore_endpoint_records():
+    """Re-publish pruned registry records that still belong to a live image.
+
+    Only a record whose :PID is a currently running image is restored: a stale
+    record for a dead process must stay pruned. Returns True when at least one
+    record was put back."""
+    pids = live_image_pids()
+    if not pids:
+        return False
+    try:
+        REGISTRY_DIR.mkdir(parents=True, exist_ok=True)
+        if not REGISTRY_BACKUP.is_dir():
+            return False
+        restored = []
+        for f in REGISTRY_BACKUP.glob("*.sexp"):
+            target = REGISTRY_DIR / f.name
+            if target.exists():
+                continue
+            try:
+                text = f.read_text(errors="replace")[:65536]
+            except OSError:
+                continue
+            m = re.search(r"(?i):pid\s+(\d+)", text)
+            if not m or m.group(1) not in pids:
+                continue
+            try:
+                shutil.copy2(str(f), str(target))
+                restored.append(f.name)
+            except OSError as e:
+                print("watchdog: endpoint restore failed for %s: %s" % (f, e),
+                      flush=True)
+        if restored:
+            print("watchdog: re-published pruned localgroup record(s): %s"
+                  % ", ".join(restored), flush=True)
+        return bool(restored)
+    except OSError as e:
+        print("watchdog: endpoint restore failed: %s" % e, flush=True)
+        return False
+
+
 def agent_status():
     """Session records from the CLI status probe.
 
@@ -227,6 +312,17 @@ def agent_status():
     except Exception as e:
         print("watchdog: status failed: %s" % e, flush=True)
         raise StatusUnknown("%s: %s" % (e.__class__.__name__, e))
+    if recs:
+        snapshot_endpoint_records()
+    elif restore_endpoint_records():
+        # A record was pruned while the image kept running: put it back and
+        # ask again before reporting a dead session.
+        recs = bridge.status_records()
+        if recs:
+            print("watchdog: session is reachable again after re-publishing "
+                  "its pruned localgroup record - no restart needed", flush=True)
+            snapshot_endpoint_records()
+            return recs
     if not recs and probe_bootstrap_failure():
         raise StatusUnknown("status probe died at SBCL bootstrap "
                             "(resource starvation, not a dead session)")
@@ -279,6 +375,73 @@ def alert_probe_failure(err):
           "cron children). I did NOT restart anything: a probe that cannot "
           "run is not a dead agent." % (err, nproc),
           kind="probe-failed", critical=True)
+
+
+AGENT_SESSION = "alagent"
+TURN_MARK = Path.home() / ".cache" / "saguaro-turn-active"
+UNREGISTERED_GRACE_SECS = 900   # never kill a session while a turn may be live
+
+
+def agent_session_exists():
+    """True when the alagent tmux session exists at all (its pane may be dead)."""
+    return sh(["/usr/bin/tmux", "has-session", "-t", AGENT_SESSION]).returncode == 0
+
+
+def agent_image_alive():
+    """True when the alagent pane still runs a live Autolith image.
+
+    `localgroup status` can report nothing while this is true: the image is
+    healthy but its discovery record has been deleted. Autolith's client
+    prunes a record on ANY query error (client.lisp localgroup-query-record
+    -> localgroup--remove-stale-record), so one transient error while the
+    agent is busy permanently unpublishes a live session. The harness guard
+    in start-sessions.sh then sees a running session and does nothing, so
+    "restarting" is a no-op and the watchdog loops until the breaker trips
+    (2026-11-04 incident, record deleted 13:48Z while a turn was running).
+    """
+    if not agent_session_exists():
+        return False
+    if sh(["/usr/bin/pgrep", "-qf", "autolith"]).returncode != 0:
+        return False
+    return sh(["/usr/bin/pgrep", "-qf", "autolith-active.core"]).returncode == 0
+
+
+def recover_unregistered():
+    """Restart a session whose image is alive but unregistered in localgroup.
+
+    The conversation lives on disk, so the restart resumes it; what is lost is
+    any turn still running inside the old image and the inbound DMs the bridge
+    could not turn into turns while the session was unreachable.
+    """
+    if breaker_open():
+        print("watchdog: breaker open - NOT restarting the unregistered session",
+              flush=True)
+        return
+    try:
+        if time.time() - TURN_MARK.stat().st_mtime < UNREGISTERED_GRACE_SECS:
+            print("watchdog: session unregistered, but a turn may still be "
+                  "running (turn marker fresh) - deferring one cycle", flush=True)
+            return
+    except OSError:
+        pass
+    print("watchdog: agent image alive but NOT registered in localgroup "
+          "-> restarting the alagent session", flush=True)
+    incident("recover-unregistered", "image alive, no localgroup record")
+    sh(["/usr/bin/tmux", "kill-session", "-t", AGENT_SESSION], timeout=30)
+    time.sleep(3)
+    sh(["/bin/sh", START], timeout=180)
+    time.sleep(30)
+    rr = status_tolerant()
+    note_restart()
+    if rr:
+        nudge_interrupted(rr[0].get("session"),
+                          "session had lost its localgroup record")
+    alert("watchdog: gregor's session had lost its localgroup registry record "
+          "(image alive, but nothing could reach it: no turns, DMs queued). "
+          "Restarted the session; back online: %s. Any DM sent during the gap "
+          "may need a resend."
+          % ("agent" if rr else "nothing yet - needs eyes"),
+          kind="recover-unregistered")
 
 
 def bridge_session_exists():
@@ -819,9 +982,46 @@ def recover_and_alert(reason):
           kind="recover")
 
 
+def check_disk():
+    """Run scripts/disk-guard.sh and page when the disk is still critical.
+
+    The guard is size-aware and only ever removes dune _build trees under
+    worktree roots that have been idle for a while (see the script header for
+    the tiers), so it is safe to run every cycle. Exit 2 means it pruned what
+    it could and free space is still under the floor - that needs eyes.
+    """
+    if not os.path.exists(DISK_GUARD):
+        return
+    try:
+        p = subprocess.run(["/bin/sh", DISK_GUARD], capture_output=True,
+                           text=True, timeout=900)
+        out = ((p.stdout or "") + (p.stderr or "")).strip()
+        if out:
+            print("watchdog: %s" % out.splitlines()[-1][:400], flush=True)
+        if p.returncode < 2:
+            return
+    except Exception as e:
+        print("watchdog: disk-guard failed: %s" % e, flush=True)
+        return
+    # Still below the floor after pruning: page, debounced.
+    if DISK_ALERTED.exists() and time.time() - DISK_ALERTED.stat().st_mtime < DISK_ALERT_GAP:
+        return
+    free = shutil.disk_usage("/").free / (1024 ** 3)
+    alert("watchdog: disk is critically full even after pruning build trees "
+          "(%.1fG free). An agent restart cannot write in this state - please "
+          "free space or grow the disk." % free, kind="disk")
+    try:
+        DISK_ALERTED.parent.mkdir(parents=True, exist_ok=True)
+        DISK_ALERTED.write_text("%d\n" % int(time.time()))
+    except OSError:
+        pass
+
+
 def main():
     global _SH_FAIL
     _SH_FAIL = None          # per-cycle probe health (see probe-vs-session)
+    # Disk first: a full filesystem breaks every other probe and repair.
+    check_disk()
     pause_left = watchdog_pause_left()
     if pause_left is not None:
         print("watchdog: paused for %s - skipping cycle (chat commands still work)"
@@ -834,7 +1034,10 @@ def main():
         alert_probe_failure(e)
         return
     if not recs:
-        recover_and_alert("no autolith session answering")
+        if agent_image_alive():
+            recover_unregistered()
+        else:
+            recover_and_alert("no autolith session answering")
         return
     if not bridge_alive():
         if bridge_session_exists():
