@@ -103,9 +103,62 @@ person's client, not a participant of its own.
 | **B. native** (image-daemon socket, `channel-subscription` directly) | exact semantics: one connection, any channel, ordered events, submission attribution | internal Lisp protocol with no stability promise, unusable from the Python parts of the harness |
 | **C. CLI + history tailing** | zero new dependencies; today's code keeps working with small edits | keeps every heuristic this rebuild exists to remove |
 
-Recommendation: **A** for the turn path, with a thin conformance layer so a
-future headless channel client can replace it without touching bridge logic.
-Verify the inbox question before building phase 4 on it.
+Recommendation: **A** for the turn path. A two-client probe settled the
+question that decided it: a client attached to a channel receives what it did
+not prompt, so one long-lived ACP connection can carry the whole surface,
+replies and proactive messages alike. Keep a thin conformance layer so a
+headless channel client can replace it without touching bridge logic.
+
+## Verified against a real build
+
+Built from this branch (`3e87496c`) in a scratch root: the release launcher
+compiles the tree when `.qlot` sits beside it, and the twelve dependencies
+whose pins moved since 0.67.22 are overlaid on the installed release's
+dependency tree. `harness/dev/channels_probe.py` repeats the checks below.
+
+- `autolith lg start` starts the world server with no terminal and prints
+  `world server PID N, Autolith 0.67.32, N open channels`.
+- `autolith --detached` creates a channel in it and prints
+  `Conversation <display id>  PID <world server pid>`; `autolith open <id>
+  --detached` resumes one.
+- `lg status --sexp` prints one readable form per hosted channel carrying
+  `:CONVERSATION-ID`, `:STATE`, `:IDLE-P`, `:WAITING-FOR-INPUT-P`,
+  `:ACTIVE-TURN-P`, `:MESSAGE-COUNT`, `:MENTION-COUNT`, `:TASK-LIVE-COUNT`,
+  `:TERMINAL-ATTACHED-P` and `:CREATED-AT`. The fields the bridge reads today
+  are all still there.
+- An empty channel is not durable (`:CONVERSATION-PERSISTED-P NIL`, no
+  `conversations/<id>/` directory), so `lg stop`, which terminates the server
+  and its channels, drops it.
+- Channel history is still a conversation: `conversations/<canonical id>/
+  NNNN.sexp`, with the `(:CONVERSATION ...)` header, `(:MESSAGE ... :SUBMISSION
+  (:ID ... :CLIENT ... :SOURCE "prompt"))` and `(:TURN-ABORTED ...)`.
+- **ACP forwards traffic the client did not prompt.** With two ACP clients on
+  one channel, the client that did not prompt received the turn running
+  event, the other client's `user_message_chunk`, the `agent_message_chunk`
+  reply and the turn idle event.
+- ACP `session/load` takes the canonical identifier (`:CONVERSATION-ID` from
+  status, not the display form) and refuses a channel that is not durable
+  yet; `session/new` opens one and returns `{sessionId, modes}` with the
+  permission modes ask, auto, sandboxed and full-access.
+- A failed turn answers `session/prompt` with JSON-RPC error -32603 and puts
+  the report in the channel transcript as `(:TURN-ABORTED ...)`; the failure
+  text also arrives as an `agent_message_chunk`.
+
+### Interface gaps for a headless client
+
+1. `lg tell` refuses with "No person is in the world yet" on a fresh root,
+   and neither `lg start` nor `--detached` changes that. The person and the
+   inbox conversation appeared only once a real client opened a channel (an
+   ACP `session/new` did it, leaving an `:INBOX-P T` conversation behind).
+   A bridge that only calls `tell` cannot open the conversation.
+2. `lg status --sexp` prints nothing both when no world server runs and when
+   it hosts no channel; only the human form names the server. A liveness
+   probe cannot use the sexp form alone.
+3. ACP attaches per channel and needs a durable conversation id, so a bridge
+   cannot watch a channel before its first durable message exists.
+4. The user init file in the live config did not compile against 0.67.32
+   (`application-status-entry` referenced an internal that moved), so a
+   saguaro upgrade has to check the agent's own init before flipping.
 
 ## Phases
 
