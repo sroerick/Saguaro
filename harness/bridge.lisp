@@ -1013,10 +1013,11 @@ under SIZE. Mirrors bridge.py's chunk_text."
 
 (defun reply-policy (surface)
   "surface: :xmpp-private | :xmpp-group | :pp-dm -> :stream or :consolidate."
-  (let ((want (case surface
-                (:pp-dm (cfg-str "pp" "reply_policy"))
-                (:xmpp-private (cfg-str "bridge" "reply_policy_private"))
-                (:xmpp-group (cfg-str "bridge" "reply_policy_group")))))
+    (let ((want (case surface
+                  (:pp-dm (cfg-str "pp" "reply_policy"))
+                  (:tuna-inbox (cfg-str "tuna" "reply_policy"))
+                  (:xmpp-private (cfg-str "bridge" "reply_policy_private"))
+                  (:xmpp-group (cfg-str "bridge" "reply_policy_group")))))
     (cond ((string-equal want "stream") :stream)
           ((string-equal want "consolidate") :consolidate)
           (t (if (eq surface :xmpp-private) :stream :consolidate)))))
@@ -1025,10 +1026,11 @@ under SIZE. Mirrors bridge.py's chunk_text."
   "MUST start with a plain word: localgroup tell treats leading-paren
 input as a local Lisp form, and an unparseable form hangs the turn in
 the Lisp debugger."
-  (let ((label (case surface
-                 (:xmpp-private "PRIVATE CHAT MESSAGE")
-                 (:xmpp-group "GROUP CHAT MESSAGE")
-                 (:pp-dm "PP DM MESSAGE"))))
+    (let ((label (case surface
+                   (:xmpp-private "PRIVATE CHAT MESSAGE")
+                   (:xmpp-group "GROUP CHAT MESSAGE")
+                   (:tuna-inbox "TUNA INBOX MESSAGE")
+                   (:pp-dm "PP DM MESSAGE"))))
     (format nil "~a - do not narrate as you work. Send one consolidated reply at the end.~%~%"
             label)))
 
@@ -1061,14 +1063,15 @@ the Lisp debugger."
   "Send TEXT to PEER. Returns t when it landed. Logs the attempt: silent
    delivery was the failure mode this bridge exists to fix."
   (log-line "deliver ~a (~d chars) to ~a" surface (length text) peer)
-  (ecase surface
-    (:pp-dm (pp-say-with-retry peer text))
-    ((:xmpp-private :xmpp-group)
-     ;; clear the typing indicator just before the body lands
-     (when (eq surface :xmpp-private)
-       (ignore-errors (xmpp-send-state peer :active)))
-     (handler-case (progn (xmpp-send-message peer surface text) t)
-       (error (e) (log-line "send to ~a failed: ~a" peer e) nil)))))
+    (ecase surface
+      (:pp-dm (pp-say-with-retry peer text))
+      (:tuna-inbox (tuna-say peer text))
+      ((:xmpp-private :xmpp-group)
+       ;; clear the typing indicator just before the body lands
+       (when (eq surface :xmpp-private)
+         (ignore-errors (xmpp-send-state peer :active)))
+       (handler-case (progn (xmpp-send-message peer surface text) t)
+         (error (e) (log-line "send to ~a failed: ~a" peer e) nil)))))
 
 ;;; ---------------------------------------------------------------------
 ;;; the turn engine
@@ -2249,6 +2252,136 @@ in-memory-only queue (lost DM observed 2026-10-09 ~06:50)."
           (run-turn peer :pp-dm prompt)))))
 
 ;;; ---------------------------------------------------------------------
+;;; tuna inbox poller (tuna.town addressing, card c3208d48)
+;;;
+;;; Tuna's message log is public and its cursor is SERVER-side, so this
+;;; poll is a plain anonymous GET: no key, no local cursor file, and a
+;;; restart cannot replay a row (the failure the pp poller was rebuilt
+;;; for on 10-27).  The first poll after a start primes: it lets the
+;;; cursor pass the backlog and delivers nothing.  A 404 means the
+;;; endpoint is not deployed yet - logged once, then skipped quietly.
+;;; ---------------------------------------------------------------------
+
+(defparameter *tuna-on* (and (cfg-bool* "tuna" "enabled")
+                             (cfg-str "tuna" "base")))
+(defparameter *tuna-base*
+  (let ((b (cfg-str "tuna" "base" "")))
+    (if (plusp (length b)) (string-right-trim "/" b) b)))
+(defparameter *tuna-inbox* (cfg-str "tuna" "inbox" "gregor"))
+(defparameter *tuna-token-file* (cfg-str "tuna" "token_file"))
+(defparameter *tuna-poll-secs* (max 1 (cfg-int "tuna" "poll_secs" 30)))
+(defparameter *tuna-allow* (cfg-list "tuna" "allow"))
+(defparameter *tuna-pending* (make-hash-table :test 'equal))
+(defparameter *tuna-primed* nil)
+(defparameter *tuna-404-logged* nil)
+(defparameter *tuna-body-tmp* "/tmp/saguaro-tuna-body.json")
+(defparameter *tuna-msg-tmp* "/tmp/saguaro-tuna-msg.json")
+
+(defun tuna-get (path)
+  "Anonymous GET against [tuna] base. Returns (values body status);
+   status 0 when the transport failed."
+  (multiple-value-bind (out err code)
+      (run-capture (list (curl-bin) "-sS" "-m" "20"
+                         "-o" *tuna-body-tmp* "-w" "%{http_code}"
+                         (concatenate 'string *tuna-base* path))
+                   30)
+    (declare (ignore err code))
+    (values (or (read-file-string *tuna-body-tmp*) "")
+            (or (ignore-errors
+                  (parse-integer
+                   (string-trim '(#\Space #\Newline #\Return #\Tab) out)
+                   :junk-allowed t))
+                0))))
+
+(defun tuna-say (peer text)
+  "POST /api/msg as this inbox identity. Returns t when the row landed.
+   Without a token_file the reply is dropped loudly: reads need no key,
+   writes do, and pretending otherwise would park the text forever."
+  (let ((tok (and *tuna-token-file*
+                  (trim (or (read-file-string *tuna-token-file*) "")))))
+    (cond
+      ((or (null tok) (zerop (length tok)))
+       (log-line "tuna reply to ~a dropped: no token_file configured" peer)
+       t)
+      (t
+       (with-open-file (f *tuna-msg-tmp* :direction :output
+                          :if-exists :supersede)
+         (format f "{\"to\":\"~a\",\"text\":\"~a\",\"kind\":\"reply\"}"
+                 (json-escape peer) (json-escape text)))
+       (multiple-value-bind (out err code)
+           (run-capture (list (curl-bin) "-sS" "-m" "20" "-X" "POST"
+                              "-H" (format nil "Authorization: Bearer ~a" tok)
+                              "-H" "Content-Type: application/json"
+                              "-d" (concatenate 'string "@" *tuna-msg-tmp*)
+                              "-o" "/dev/null" "-w" "%{http_code}"
+                              (concatenate 'string *tuna-base* "/api/msg"))
+                        30)
+         (declare (ignore err code))
+         (let ((status (or (ignore-errors
+                             (parse-integer
+                              (string-trim '(#\Space #\Newline #\Return #\Tab) out)
+                              :junk-allowed t))
+                           0)))
+           (log-line "tuna reply to ~a: HTTP ~a" peer status)
+           (= status 201)))))))
+
+(defun run-tuna-turn (peer bodies)
+  (let ((text (format nil "~{~a~^~%~}" bodies)))
+    (log-line "tuna inbox from ~a (~d chars)" peer (length text))
+    (let ((prompt (if (eq (reply-policy :tuna-inbox) :stream)
+                      text
+                      (concatenate 'string
+                                   (consolidate-prefix :tuna-inbox) text))))
+      (run-turn peer :tuna-inbox prompt))))
+
+(defun tuna-poll ()
+  (handler-case
+      (multiple-value-bind (body status)
+          (tuna-get (format nil "/api/inbox/~a" *tuna-inbox*))
+        (cond
+          ((= status 404)
+           (unless *tuna-404-logged*
+             (setf *tuna-404-logged* t)
+             (log-line "tuna inbox 404 at ~a (endpoint not deployed); quiet from here"
+                       *tuna-base*)))
+          ((/= status 200)
+           (log-line "tuna inbox HTTP ~a from ~a" status *tuna-base*))
+          (t
+           (setf *tuna-404-logged* nil)
+           (let* ((data (json-parse body))
+                  (rows (or (jget data "messages") ())))
+             (if (not *tuna-primed*)
+                 (progn
+                   (setf *tuna-primed* t)
+                   (log-line
+                    "tuna inbox ~a primed at cursor ~a (~d backlog row(s) skipped)"
+                    *tuna-inbox* (or (jget data "cursor") "?") (length rows)))
+                 (dolist (row rows)
+                     (let ((frm (format nil "~a" (jget row "from")))
+                           (text (format nil "~a" (jget row "body")))
+                           (seq (format nil "~a" (jget row "seq")))
+                           (kind (format nil "~a" (jget row "kind"))))
+                       (cond
+                         ((string-equal kind "ack")
+                          ;; A seat ack means "seen, queued": no work in it. Waking a
+                          ;; turn for one earns another ack, and the pair ping-pongs
+                          ;; (11-04: seq 26/29/30, a turn every poll interval).
+                          (log-line "tuna inbox: seq ~a ack from ~a (skipped)" seq frm))
+                         ((and (plusp (length text))
+                               (string/= frm *tuna-inbox*)
+                               (or (null *tuna-allow*)
+                                   (member frm *tuna-allow* :test #'string=)))
+                          (log-line "tuna inbox: seq ~a from ~a" seq frm)
+                          (push (format nil "[tuna #~a from ~a] ~a" seq frm text)
+                                  (gethash frm *tuna-pending* '())))))))
+             (unless *turn*
+               (loop for peer being the hash-keys of *tuna-pending*
+                     do (let ((bodies (nreverse (gethash peer *tuna-pending*))))
+                          (remhash peer *tuna-pending*)
+                          (when bodies (run-tuna-turn peer bodies))
+                            (return))))))))
+    (error (e) (log-line "tuna inbox poll error: ~a" e))))
+;;; ---------------------------------------------------------------------
 ;;; picker watcher (unattended TUI: answer blocking pickers/debuggers)
 ;;; ---------------------------------------------------------------------
 
@@ -2277,6 +2410,7 @@ in-memory-only queue (lost DM observed 2026-10-09 ~06:50)."
 
 (defparameter *main-last-keepalive* 0)
 (defparameter *main-last-pp-poll* 0)
+(defparameter *main-last-tuna-poll* 0)
 (defparameter *main-last-flush* 0)
 (defparameter *main-last-task-poll* 0)
 (defparameter *main-last-xmpp-ping* 0)
@@ -2404,6 +2538,11 @@ in-memory-only queue (lost DM observed 2026-10-09 ~06:50)."
                 (when (> (- (now) *main-last-pp-poll*) *pp-poll-secs*)
                   (setf *main-last-pp-poll* (now))
                   (pp-poll)))
+                ;; 5b. tuna inbox poller (public log, server-side cursor)
+                (when *tuna-on*
+                  (when (> (- (now) *main-last-tuna-poll*) *tuna-poll-secs*)
+                    (setf *main-last-tuna-poll* (now))
+                    (tuna-poll)))
               ;; 6. picker watcher
               (picker-watch)
 
