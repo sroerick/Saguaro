@@ -1,4 +1,5 @@
 engine:    autolith (github.com/lambda-symbolics/autolith)
 tested:    v0.50.0  (in production on this stack since 2026-09-19)
 latest:    v0.60.0  (upstream release 2026-10-09; installed here, soak pending)
-policy:    pin conservatively; bump after a soak on your own deployment
+next:      branch lho/channels @ 3e87496c (VERSION 0.67.32), the channel
+           interface; migration plan in CHANNELS.md
