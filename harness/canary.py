@@ -214,6 +214,22 @@ def conversation_round_trip(conv, token):
                    "reply after it yet" % (token, tok_seq, conv))
 
 
+def pick_wake_session(recs, want):
+    """Choose the session the canary should judge."""
+    # 2026-11-13: on channel builds `localgroup status` lists EVERY
+    # hosted channel, and one with no conversation on disk (a console
+    # workspace opened from another directory) can list first. Judge the
+    # configured standing conversation, then any session whose conversation
+    # has records, and only then whatever answered.
+    for r in recs:
+        if want and r.get("conversation") == want:
+            return r
+    for r in recs:
+        if newest_record_age(r.get("conversation")) is not None:
+            return r
+    return recs[0]
+
+
 def main():
     """Run the canary (see module docstring). Returns the exit code."""
     if str(B.get("canary", "off")).lower() != "on":
@@ -271,7 +287,7 @@ def main():
     if not recs:
         fail("wake: no autolith session answered status")
         return 1
-    rec = recs[0]
+    rec = pick_wake_session(recs, bridge.A.get("conv"))
     # 2026-09-30: status answering is NOT health. Require recent turn activity.
     age = newest_record_age(rec.get("conversation"))
     stale_h = float(B.get("stale_turn_hours", 5))
