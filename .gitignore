@@ -5,3 +5,4 @@ config.toml
 *.log
 persona.md
 bridge.err*
+harness/pp-dm-cursors.sexp
