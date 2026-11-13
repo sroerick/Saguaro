@@ -240,8 +240,11 @@ client of the same person, not a second conversation."
         :thread nil))
 
 (defun worker-for (key)
-  (or (gethash key *workers*)
-      (setf (gethash key *workers*) (make-worker key))))
+  ;; Two peers can arrive at once from different adapter pollers, so worker
+  ;; creation is serialized: otherwise one queue gets two threads.
+  (sb-thread:with-recursive-lock (*workers-lock*)
+    (or (gethash key *workers*)
+        (setf (gethash key *workers*) (make-worker key)))))
 
 (defun channel-queue-size (key)
   (let ((worker (gethash key *workers*)))
@@ -268,7 +271,7 @@ client of the same person, not a second conversation."
   (let ((worker (worker-for key)))
     (sb-thread:with-mutex ((getf worker :lock))
       (setf (getf worker :queue) (nconc (getf worker :queue) (list job))))
-    (sb-thread:with-mutex (*workers-lock*)
+    (sb-thread:with-recursive-lock (*workers-lock*)
       (unless (getf worker :thread)
         (setf (getf worker :thread)
               (sb-thread:make-thread (lambda () (worker-loop worker))
