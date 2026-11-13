@@ -127,7 +127,7 @@ session_up() {   # $1 = tmux session name   $2 = pgrep pattern for its process
 if ! session_up alagent "autolith"; then
   tmux kill-session -t alagent 2>/dev/null || true
   tmux new-session -d -s alagent \
-    "CL_EXEC_SANDBOX_PROCESS_GROUP_HELPER=$SB_HELPER AUTOLITH_COMPACTION_THRESHOLD=80 AUTOLITH_CONTEXT_WINDOW=524288 $LAUNCH --permissions full 2>&1"
+    "CL_EXEC_SANDBOX_PROCESS_GROUP_HELPER=$SB_HELPER AUTOLITH_COMPACTION_THRESHOLD=60 AUTOLITH_CONTEXT_WINDOW=524288 $LAUNCH --permissions full 2>&1"
 fi
 
 # Bridge engine (2026-09-27): the Common Lisp bridge is the default; set
