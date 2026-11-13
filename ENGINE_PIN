@@ -4,6 +4,9 @@ latest:    v0.60.0  (upstream release 2026-10-09)
 channels:  branch lho/channels @ 3e87496c (VERSION 0.67.32), merged into main
            2026-11-13; the harness now targets the channel interface
            (migration plan and verified facts in CHANNELS.md)
-running:   gregor is on v0.67.12 as of 2026-11-13, behind the 0.67.32 the
-           channel facts were verified on; phases 2-5 in CHANNELS.md still
-           owe their own checks against that build
+running:   gregor took v0.67.36 on 2026-11-13 (release .preflight at 16:07,
+           tmux+rlimits cutover at 17:57). That build dropped `resume`, so
+           start-sessions.sh probes for `open`; it runs main f9fce33 with the
+           channel work loaded but [channels] engine = "legacy", because the
+           per-channel engine opens detached sessions whose conversations never
+           land on disk (every turn: NEVER-STARTED). See CHANNELS.md.
