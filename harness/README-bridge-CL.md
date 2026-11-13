@@ -15,6 +15,34 @@ External contracts are unchanged, so `watchdog.py` / `canary.py` /
 `harness/bridge.log`, config `harness/config.toml`, turn marker
 `~/.cache/saguaro-turn-active`.
 
+## Layout — one library per concern (2026-11-13)
+
+`bridge.lisp` is the entry point: it loads `lib/*.lisp` in order and calls
+`(sg.bridge:main)` unless `SAGUARO_NO_MAIN` is set. Everything else is a module
+with its own package, its own file, and its own ASDF system (`harness/saguaro.asd`):
+
+| module | package | what |
+|---|---|---|
+| `lib/core.lisp` | `sg.core` | paths, TOML config, logging, subprocess capture, JSON, base64, durable state |
+| `lib/autolith.lisp` | `sg.autolith` | conversation records, turn engine, reply policy and chunking, the surface registry, owner commands, task and notice delivery |
+| `lib/xmpp.lisp` | `sg.xmpp` | tunnel, stream, SASL, bind, MUC, stanza dispatch, `:xmpp-private`, `:xmpp-group` |
+| `lib/pricklypear.lisp` | `sg.pp` | eval client, send with retry, cursors, poller, `:pp-dm` |
+| `lib/tuna.lisp` | `sg.tuna` | the tuna inbox lane, `:tuna-inbox` |
+| `lib/zulip.lisp` | `sg.zulip` | events queue, should-I-respond policy, sender, `:zulip` |
+| `lib/bridge.lisp` | `sg.bridge` | start-up, main loop, picker watcher |
+
+Dependency direction is one way: `core <- autolith <- adapters <- bridge`. An
+adapter owns its surface: it registers a sender, a chat-state refresher, its
+reply policy, its label and its tick with `sg.autolith:register-surface` /
+`register-poller` / `register-status`, so nothing in `autolith.lisp` names a
+transport. A new transport is one module, one registration and one start-up call.
+
+`harness/dev/split_check.lisp` compiles and loads every module in order and
+reports unresolved names; its exit status is the number of unresolved names.
+
+Load one module on its own with `(asdf:load-asd "harness/saguaro.asd")` then
+`(asdf:load-system "saguaro-xmpp")`. The shipped bridge never loads ASDF.
+
 ## Transports — pp is the default, xmpp is opt-in (2026-10-25)
 
 `[bridge] transports` decides which surfaces the bridge serves:
