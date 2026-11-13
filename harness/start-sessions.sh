@@ -97,12 +97,20 @@ fi
 CONV="$("$PY" -c 'import os,sys,tomllib
 b = tomllib.loads(open(os.environ["BRIDGE_CONFIG"]).read())["autolith"]
 print(b.get("conv", ""))' 2>/dev/null)"
+# Launch verb: the channel builds (0.67.32+) replace `resume` with `open`.
+# Probe the installed build rather than pinning one, so an older release still
+# starts; the binary answers --help on the subcommand either way.
 # Resume only when the standing conversation actually exists on disk. A
 # fresh/rotated conv id in config.toml therefore starts a brand-new
 # conversation (reset-friendly) instead of failing to resume a phantom.
-RESUME=""
+CONV_PRESENT=""
 if [ -n "$CONV" ] && [ -d "$HOME/.local/share/autolith/conversations/$CONV" ]; then
-  RESUME="resume $CONV"
+  CONV_PRESENT="$CONV"
+fi
+if "$AL" open --help >/dev/null 2>&1; then
+  LAUNCH="$AL open${CONV_PRESENT:+ $CONV_PRESENT}"
+else
+  LAUNCH="$AL resume${CONV_PRESENT:+ $CONV_PRESENT}"
 fi
 
 # Live-process guard (2026-09-19 fix). A tmux session whose command has
@@ -119,7 +127,7 @@ session_up() {   # $1 = tmux session name   $2 = pgrep pattern for its process
 if ! session_up alagent "autolith"; then
   tmux kill-session -t alagent 2>/dev/null || true
   tmux new-session -d -s alagent \
-    "CL_EXEC_SANDBOX_PROCESS_GROUP_HELPER=$SB_HELPER AUTOLITH_COMPACTION_THRESHOLD=80 AUTOLITH_CONTEXT_WINDOW=524288 $AL $RESUME --permissions full 2>&1"
+    "CL_EXEC_SANDBOX_PROCESS_GROUP_HELPER=$SB_HELPER AUTOLITH_COMPACTION_THRESHOLD=80 AUTOLITH_CONTEXT_WINDOW=524288 $LAUNCH --permissions full 2>&1"
 fi
 
 # Bridge engine (2026-09-27): the Common Lisp bridge is the default; set
