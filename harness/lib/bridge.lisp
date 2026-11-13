@@ -7,7 +7,7 @@
 ;;;; loads the modules in order and calls MAIN.
 
 (defpackage :SG.BRIDGE
-  (:use :CL :SG.CORE :SG.AUTOLITH :SG.XMPP :SG.PP :SG.TUNA :SG.ZULIP)
+  (:use :CL :SG.CORE :SG.AUTOLITH :SG.CHANNEL :SG.XMPP :SG.PP :SG.TUNA :SG.ZULIP)
   (:export
    #:*PICKER-LAST*
    #:*PICKER-PANE*
@@ -171,7 +171,7 @@
                                               (concatenate 'string
                                                            (consolidate-prefix surface)
                                                            text))))
-                             (run-turn (getf item :peer) surface prompt)))))))
+                             (run-channel-turn (getf item :peer) surface prompt)))))))
               ;; 4. streaming surfaces: deliver narration as it flushes
               (when *turn* (ignore-errors (stream-poll nil)))
               ;; 5. pp dm poller

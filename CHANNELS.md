@@ -84,7 +84,7 @@ returning parsed records above a watermark. `channels` implements `submit`
 and `next-events` over the event stream. Everything above the seam (reply
 policy, chunking, parking, XMPP, pp, commands) is unchanged.
 
-## Surface to channel map
+## Surface to channel mapnnImplemented in the bridge on 2026-11-13: `lib/channel.lisp` (`sg.channel`) keys anchannel by (surface, peer), keeps the key -> conversation mapping inn`~/.cache/saguaro-channels.sexp`, opens one world-server session per peer withn`autolith --detached`, and gives each channel its own turn queue, so two peersnare answered in parallel. `[channels] engine = "legacy"` collapses everynsurface back onto the single `[autolith] conv` conversation.
 
 | surface | channel | delivery |
 |---|---|---|

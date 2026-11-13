@@ -94,3 +94,12 @@ max_reply_chars = 8000
 #stall_secs = 300            # quiet seconds after idle => turn is over
 #start_timeout_secs = 120    # give up if the tell never registers activity
 #conversations_dir = ""     # default: ~/.local/share/autolith/conversations
+
+[channels]
+# One channel per surface and peer (2026-11-13). "channels" opens a world-server
+# session per peer with `autolith --detached`, keeps its id in
+# ~/.cache/saguaro-channels.sexp, and runs one turn at a time per channel.
+# "legacy" keeps the single shared [autolith] conv the bridge used before.
+engine = "channels"
+create_timeout_secs = 60
+# permissions = "auto"

@@ -25,7 +25,7 @@ with its own package, its own file, and its own ASDF system (`harness/saguaro.as
 |---|---|---|
 | `lib/core.lisp` | `sg.core` | paths, TOML config, logging, subprocess capture, JSON, base64, durable state |
 | `lib/autolith.lisp` | `sg.autolith` | conversation records, turn engine, reply policy and chunking, the surface registry, owner commands, task and notice delivery |
-| `lib/xmpp.lisp` | `sg.xmpp` | tunnel, stream, SASL, bind, MUC, stanza dispatch, `:xmpp-private`, `:xmpp-group` |
+| `lib/channel.lisp` | `sg.channel` | one channel per surface and peer: registry, world-server channels, per-channel turn queues |n| `lib/xmpp.lisp` | `sg.xmpp` | tunnel, stream, SASL, bind, MUC, stanza dispatch, `:xmpp-private`, `:xmpp-group` |
 | `lib/pricklypear.lisp` | `sg.pp` | eval client, send with retry, cursors, poller, `:pp-dm` |
 | `lib/tuna.lisp` | `sg.tuna` | the tuna inbox lane, `:tuna-inbox` |
 | `lib/zulip.lisp` | `sg.zulip` | events queue, should-I-respond policy, sender, `:zulip` |

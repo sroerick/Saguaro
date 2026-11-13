@@ -4,7 +4,7 @@
 ;;;; poller that turns habitat DMs into turns (:pp-dm).
 
 (defpackage :SG.PP
-  (:use :CL :SG.CORE :SG.AUTOLITH)
+  (:use :CL :SG.CORE :SG.AUTOLITH :SG.CHANNEL)
   (:export
    #:*PP-ON*
    #:*PP-BASE*
@@ -266,7 +266,7 @@ parks the text so it is retried later, never dropped."
                           text
                           (concatenate 'string
                                        (consolidate-prefix :pp-dm) text))))
-          (run-turn peer :pp-dm prompt)))))
+          (run-channel-turn peer :pp-dm prompt)))))
 
 
 ;;; ---------------------------------------------------------------------

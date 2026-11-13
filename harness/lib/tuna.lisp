@@ -3,7 +3,7 @@
 ;;;; fetched over HTTP wake a turn between chats.
 
 (defpackage :SG.TUNA
-  (:use :CL :SG.CORE :SG.AUTOLITH)
+  (:use :CL :SG.CORE :SG.AUTOLITH :SG.CHANNEL)
   (:export
    #:*TUNA-ON*
    #:*TUNA-BASE*
@@ -104,7 +104,7 @@
                       text
                       (concatenate 'string
                                    (consolidate-prefix :tuna-inbox) text))))
-      (run-turn peer :tuna-inbox prompt))))
+      (run-channel-turn peer :tuna-inbox prompt))))
 
 (defun tuna-poll ()
   (handler-case

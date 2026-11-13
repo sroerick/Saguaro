@@ -36,7 +36,7 @@
 #+sbcl (eval-when (:compile-toplevel :load-toplevel :execute)
          (require :sb-posix))
 
-(defparameter *bridge-modules* '("core" "autolith" "xmpp" "pricklypear" "tuna" "zulip" "bridge")
+(defparameter *bridge-modules* '("core" "autolith" "channel" "xmpp" "pricklypear" "tuna" "zulip" "bridge")
   "Load order: each name is lib/NAME.lisp and may use everything before it.")
 
 (defun bridge-dir ()
