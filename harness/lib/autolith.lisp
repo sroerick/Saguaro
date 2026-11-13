@@ -414,8 +414,9 @@
       (remhash (namestring p) *file-cache*))))
 
 (defun advance-watermarks (new-records)
-  (dolist (item new-records)
-    (bump-watermark (first item) (second item))))
+  (with-state-lock
+    (dolist (item new-records)
+      (bump-watermark (first item) (second item)))))
 
 ;;; ---------------------------------------------------------------------
 ;;; reply extraction
@@ -589,25 +590,27 @@ the Lisp debugger."
 ;;; ---------------------------------------------------------------------
 
 (defun park-pending (peer surface text)
-  (setf (getf *state* :parked)
-        (append (getf *state* :parked)
-                (list (list :peer peer :surface surface :text text))))
-  (save-state)
-  (log-line "parked undelivered text for ~a (~d parked)"
-            peer (length (getf *state* :parked))))
+  (with-state-lock
+    (setf (getf *state* :parked)
+          (append (getf *state* :parked)
+                  (list (list :peer peer :surface surface :text text))))
+    (save-state)
+    (log-line "parked undelivered text for ~a (~d parked)"
+              peer (length (getf *state* :parked)))))
 
 (defun flush-parked ()
-  (loop for item = (first (getf *state* :parked))
-        while item
-        do (let ((peer (getf item :peer))
-                 (surface (getf item :surface))
-                 (text (getf item :text)))
-             (if (deliver-once peer surface text)
-                 (progn
-                   (setf (getf *state* :parked) (rest (getf *state* :parked)))
-                   (save-state)
-                   (log-line "flushed parked delivery to ~a" peer))
-                 (return)))))
+  (with-state-lock
+    (loop for item = (first (getf *state* :parked))
+          while item
+          do (let ((peer (getf item :peer))
+                   (surface (getf item :surface))
+                   (text (getf item :text)))
+               (if (deliver-once peer surface text)
+                   (progn
+                     (setf (getf *state* :parked) (rest (getf *state* :parked)))
+                     (save-state)
+                     (log-line "flushed parked delivery to ~a" peer))
+                   (return))))))
 
 (defun deliver-once (peer surface text)
   "Send TEXT to PEER through the sender its surface registered. Returns t
@@ -885,9 +888,15 @@ never delivered."
           (setf (getf *turn* :streamed) n
                 (getf *turn* :streamed-watermarks) new))))))
 
-(defun run-turn (peer surface prompt)
-  "One full turn. Returns :delivered | :parked | :failed | :no-session."
-  (let ((rec (pick-session)))
+(defun run-turn (peer surface prompt &key session conversation)
+  "One full turn on one channel. Returns :delivered | :parked | :failed | :no-session.
+
+SESSION and CONVERSATION name the channel to use. Omitted, the turn picks a
+session the way the single-conversation bridge did before channels."
+  (let* ((rec (if session
+                  (list :session session :conversation (or conversation *al-conv*))
+                  (pick-session)))
+         (*al-conv* (or (and rec (getf rec :conversation)) *al-conv*)))
     (unless (and rec (getf rec :conversation))
       (deliver-once peer surface "(no autolith session available)")
       (return-from run-turn :no-session))

@@ -25,7 +25,7 @@
   :depends-on ("saguaro-core")
   :components ((:file "autolith")))
 
-(defsystem "saguaro-xmpp"
+(defsystem "saguaro-channel"n  :description "One channel per surface and peer: registry, world-server channels, per-channel turn queues."n  :license "MIT"n  :pathname "lib"n  :depends-on ("saguaro-autolith")n  :components ((:file "channel")))nn(defsystem "saguaro-xmpp"
   :description "XMPP transport: tunnel, stream, SASL, bind, MUC, stanza dispatch, :xmpp-private and :xmpp-group."
   :license "MIT"
   :pathname "lib"
@@ -57,7 +57,7 @@
   :description "Start-up, the main loop and the picker watcher: the only module that knows which adapters exist."
   :license "MIT"
   :pathname "lib"
-  :depends-on ("saguaro-xmpp" "saguaro-pricklypear" "saguaro-tuna" "saguaro-zulip")
+  :depends-on ("saguaro-channel" "saguaro-xmpp" "saguaro-pricklypear" "saguaro-tuna" "saguaro-zulip")
   :components ((:file "bridge")))
 
 (defsystem "saguaro"

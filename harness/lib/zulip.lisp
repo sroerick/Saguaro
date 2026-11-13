@@ -6,7 +6,7 @@
 ;;;; registers its sender and reply policy with SG.AUTOLITH:REGISTER-SURFACE.
 
 (defpackage :SG.ZULIP
-  (:use :CL :SG.CORE :SG.AUTOLITH)
+  (:use :CL :SG.CORE :SG.AUTOLITH :SG.CHANNEL)
   (:export
    #:*ZULIP-SITE*
    #:*ZULIP-EMAIL*
@@ -427,7 +427,7 @@
           (wanted
            (log-line "zulip: answering ~a (~a) from ~a" peer reason (getf message :sender))
            (zulip-follow message)
-           (run-turn peer :zulip (zulip-prompt message)))
+           (run-channel-turn peer :zulip (zulip-prompt message)))
           (t
            (log-line "zulip: skipping message ~a from ~a (~a)"
                      (getf message :id) (getf message :sender) reason)))))))

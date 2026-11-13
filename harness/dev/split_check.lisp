@@ -26,7 +26,7 @@
                  (concatenate 'string *lib-dir* "../config.example.toml")
                  1)
 
-(defparameter *module-list* '("core" "autolith" "xmpp" "pricklypear" "tuna" "zulip" "bridge"))
+(defparameter *module-list* '("core" "autolith" "channel" "xmpp" "pricklypear" "tuna" "zulip" "bridge"))
 
 (defparameter *interesting* '("undefined" "not found" "does not exist" "unknown variable"))
 

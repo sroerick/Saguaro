@@ -53,6 +53,8 @@
    #:*TRANSPORTS*
    #:TRANSPORT-ON-P   #:GETENV*
    #:CURL-BIN
+   #:*STATE-LOCK*
+   #:WITH-STATE-LOCK
 ))
 (in-package :SG.CORE)
 
@@ -448,32 +450,41 @@ OpenBSD SBCL rejects run-program :output :string, hence pipes (glochid)."
 (defparameter *state*
   (list :version 1 :watermarks '() :parked '() :queue '()))
 
+(defparameter *state-lock* (sb-thread:make-mutex :name "saguaro-state")
+  "Serializes *STATE* across channel worker threads. Recursive: the mutators
+take it and then call SAVE-STATE, which takes it again.")
+
+(defmacro with-state-lock (&body body)
+  `(sb-thread:with-recursive-lock (*state-lock*) ,@body))
+
 (defun load-state ()
-  (let ((raw (read-file-string *state-path*)))
-    (when raw
-      (handler-case
-          (let ((form (with-input-from-string (s raw)
-                        (let ((*package* (find-package :keyword))
-                              (*read-eval* nil))
-                          (read s)))))
-            (when (and (listp form) (eq (getf form :version) 1))
-              (setf *state* form)))
-        (error (e) (format t "state: unreadable, starting fresh: ~a~%" e))))
+  (with-state-lock
+    (let ((raw (read-file-string *state-path*)))
+      (when raw
+        (handler-case
+            (let ((form (with-input-from-string (s raw)
+                          (let ((*package* (find-package :keyword))
+                                (*read-eval* nil))
+                            (read s)))))
+              (when (and (listp form) (eq (getf form :version) 1))
+                (setf *state* form)))
+          (error (e) (format t "state: unreadable, starting fresh: ~a~%" e))))
       (unless (getf *state* :version)
-          (setf *state* (list :version 1 :watermarks '() :parked '() :queue '())))))
+        (setf *state* (list :version 1 :watermarks '() :parked '() :queue '()))))))
 
 (defun save-state ()
   "Persist watermarks + parked deliveries. A failure here means replies can
    be lost on restart, so it is reported, not swallowed."
-  (handler-case
-      (progn
-        (ensure-directories-exist *state-path*)
-        (with-open-file (f *state-path* :direction :output
-                           :if-exists :supersede :if-does-not-exist :create)
-          (let ((*package* (find-package :keyword)))
-            (prin1 *state* f))
-          (terpri f)))
-    (error (e) (log-line "STATE SAVE FAILED (~a): ~a" *state-path* e))))
+  (with-state-lock
+    (handler-case
+        (progn
+          (ensure-directories-exist *state-path*)
+          (with-open-file (f *state-path* :direction :output
+                             :if-exists :supersede :if-does-not-exist :create)
+            (let ((*package* (find-package :keyword)))
+              (prin1 *state* f))
+            (terpri f)))
+      (error (e) (log-line "STATE SAVE FAILED (~a): ~a" *state-path* e)))))
 
 (defun watermark-for (path)
   (or (cdr (assoc (namestring path) (getf *state* :watermarks)
