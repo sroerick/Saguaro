@@ -614,6 +614,7 @@ instead of returning nil, which would have spun silently forever.)"
     ;; top up the buffer with whatever is readable right now
     (loop while (listen in)
           do (let ((ch (read-char in nil :eof)))
+               (when (eq ch :eof) (error "xmpp stream closed"))
                (incf got)
                (setf *last-inbound* (now))
                (setf (getf *conn* :buf)
@@ -621,6 +622,10 @@ instead of returning nil, which would have spun silently forever.)"
     ;; extract at most one complete stanza from the buffer
     (multiple-value-bind (stanza rest)
         (extract-stanza (getf *conn* :buf))
+      ;; the split into modules dropped this guard (and the :eof one above),
+      ;; so :stream-close came back as if it were a stanza and the caller died
+      ;; with ":STREAM-CLOSE is not of type SEQUENCE" on every rejoin.
+      (when (eq stanza :stream-close) (error "xmpp stream closed"))
       (if stanza
           (progn (setf (getf *conn* :buf) rest) stanza)
           ;; idle: keep the ~0.5s loop granularity; mid-stanza: brief
