@@ -4,6 +4,13 @@
 ;;;; durable state file that holds watermarks and parked texts.
 ;;;; 
 ;;;; No transport and no agent knowledge lives here.
+;;;; The reader package for autolith .sexp records. A record carries
+;;;; #A((n) BASE-CHAR ...) literals, so it must be read with CL symbols and never
+;;;; with keywords (README-bridge-CL.md). This file loads first, so the package
+;;;; exists before autolith.lisp calls (find-package :bridge-sexp-read); the
+;;;; split into modules dropped the defpackage and every record read then died
+;;;; with "The value NIL is not of type PACKAGE when binding *PACKAGE*".
+(defpackage :bridge-sexp-read (:use :cl))
 
 (defpackage :SG.CORE
   (:use :CL)
