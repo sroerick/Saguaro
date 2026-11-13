@@ -158,7 +158,7 @@
   "Words that address this bot: configured, else its full name and login."
   (let* ((own (zulip-own-name))
          (mine (when (plusp (length own))
-                 (uiop:split-string (string-downcase own) :separator " "))))
+                 (zulip-split (string-downcase own) #\Space))))
     (remove-duplicates
      (remove "" (append (mapcar #'string-downcase (or *zulip-name-words* mine))
                          (list (zulip-email-local (zulip-email*)))))
