@@ -5,9 +5,30 @@ at `3e87496c` (VERSION 0.67.32). The design intent behind it is
 `docs/autolith-channel-proposal.org` in that tree. This file records what the
 harness has to become.
 
-Merged into `main` on 2026-11-13, after gregor was upgraded: the branch and this
-file no longer sit aside. gregor itself runs 0.67.12, which is behind the build
-the observations below were taken on, so phases 2-5 still owe their own checks.
+Merged into `main` on 2026-11-13: the branch and this file no longer sit aside.
+gregor went to 0.67.36 the same day (preflight 16:07, tmux+rlimits cutover
+17:57) and main was rolled out there through f9fce33. What that live run
+established:
+
+- 0.67.36 has no `resume` verb. `autolith open [ID] [--detached]` replaces it and
+  also starts the world server that hosts the channel. `start-sessions.sh` probes
+  `autolith open --help` and falls back to `resume` only on older builds; without
+  that every watchdog recovery failed (exit 64) and the crash-loop breaker tripped.
+- Two guards were lost in the module split and only fail at runtime:
+  `(find-package :bridge-sexp-read)` needs its `defpackage` (records carry
+  `#A((n) BASE-CHAR ...)` and cannot be read in KEYWORD), and
+  `xmpp-next-stanza-with-timeout` must raise on `:eof` and `:stream-close` instead
+  of handing the keyword back as a stanza. Restored in `lib/core.lisp` and
+  `lib/xmpp.lisp`.
+- The `channels` engine does not work yet on 0.67.36: `autolith --detached`
+  reports a session in `lg status --sexp` while no `conversations/<id>` directory
+  ever appears, so `lg tell` lands nowhere and every turn logs
+  `turn over: NEVER-STARTED (no activity; tell may not have landed)`.
+  gregor therefore runs `[channels] engine = "legacy"`, which routes every
+  surface to the standing conversation and does complete turns (verified
+  19:29:59Z ping, `turn over: DONE` 19:30:44Z, 65 records / 1 assistant text,
+  reply delivered to the MUC). Phases 3-5 still owe their own checks, and
+  canary.py still looks for its token in the standing conversation.
 
 ## The interface that replaces sessions
 
