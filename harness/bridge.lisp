@@ -534,6 +534,10 @@ OpenBSD SBCL rejects run-program :output :string, hence pipes (glochid)."
 (defparameter *pp-allow* (cfg-list "pp" "allow"))
 (defparameter *pp-inbox-lib* (cfg-str "pp" "inbox_lib"))
 
+;;; The Zulip surface keeps its own file; it uses the helpers defined above.
+(when (probe-file (merge-pathnames "zulip.lisp" *harness-dir*))
+  (load (merge-pathnames "zulip.lisp" *harness-dir*)))
+
 (defun pp-token ()
   (or (and *pp-token-file* (trim (or (read-file-string *pp-token-file*) "")))
       (getenv* "PP_TOKEN")
@@ -1016,6 +1020,7 @@ under SIZE. Mirrors bridge.py's chunk_text."
     (let ((want (case surface
                   (:pp-dm (cfg-str "pp" "reply_policy"))
                   (:tuna-inbox (cfg-str "tuna" "reply_policy"))
+                  (:zulip (cfg-str "zulip" "reply_policy"))
                   (:xmpp-private (cfg-str "bridge" "reply_policy_private"))
                   (:xmpp-group (cfg-str "bridge" "reply_policy_group")))))
     (cond ((string-equal want "stream") :stream)
@@ -1030,6 +1035,7 @@ the Lisp debugger."
                    (:xmpp-private "PRIVATE CHAT MESSAGE")
                    (:xmpp-group "GROUP CHAT MESSAGE")
                    (:tuna-inbox "TUNA INBOX MESSAGE")
+                   (:zulip "ZULIP MESSAGE")
                    (:pp-dm "PP DM MESSAGE"))))
     (format nil "~a - do not narrate as you work. Send one consolidated reply at the end.~%~%"
             label)))
@@ -1066,6 +1072,7 @@ the Lisp debugger."
     (ecase surface
       (:pp-dm (pp-say-with-retry peer text))
       (:tuna-inbox (tuna-say peer text))
+        (:zulip (zulip-deliver peer text))
       ((:xmpp-private :xmpp-group)
        ;; clear the typing indicator just before the body lands
        (when (eq surface :xmpp-private)
@@ -2432,7 +2439,7 @@ in-memory-only queue (lost DM observed 2026-10-09 ~06:50)."
     (kill-orphan-transports))
   (log-line "CL bridge starting (config ~a) transports=[~{~a~^ ~}]"
             *config-path* *transports*)
-  (unless (or *xmpp-on* *pp-on*)
+  (unless (or *xmpp-on* *pp-on* *zulip-on*)
     (log-line "WARNING: no surface is live (transports=~s; pp needs [pp] enabled=true and base) — idling with nothing to serve"
               *transports*))
   ;; restore anything queued when a previous run died (see queue-sync)
@@ -2538,6 +2545,11 @@ in-memory-only queue (lost DM observed 2026-10-09 ~06:50)."
                 (when (> (- (now) *main-last-pp-poll*) *pp-poll-secs*)
                   (setf *main-last-pp-poll* (now))
                   (pp-poll)))
+                ;; 5a. zulip poller
+                (when *zulip-on*
+                  (when (> (- (now) *main-last-zulip-poll*) *zulip-poll-secs*)
+                    (setf *main-last-zulip-poll* (now))
+                    (ignore-errors (zulip-service))))
                 ;; 5b. tuna inbox poller (public log, server-side cursor)
                 (when *tuna-on*
                   (when (> (- (now) *main-last-tuna-poll*) *tuna-poll-secs*)

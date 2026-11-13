@@ -19,6 +19,7 @@
 (defparameter *zulip-name-words* (cfg-list "zulip" "name_words"))
 (defparameter *zulip-reply-policy* (cfg-str "zulip" "reply_policy" "consolidate"))
 (defparameter *zulip-poll-secs* (cfg-int "zulip" "poll_secs" 5))
+(defparameter *main-last-zulip-poll* 0)
 (defparameter *zulip-chunk-chars* (cfg-int "zulip" "chunk_chars" 3000))
 (defparameter *zulip-state-path* (home-path ".cache/saguaro-zulip-queue"))
 (defparameter *zulip-netrc-path* (home-path ".cache/saguaro-zulip.netrc"))
