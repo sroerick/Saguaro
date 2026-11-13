@@ -36,6 +36,12 @@
                                                :name nil :type nil))
                            #p"/home/al/saguaro-live/harness/")))
 
+;; The bridge is loaded as a library, so its modules are packages now: say.lisp
+;; works in a package that uses them, and every name below resolves through the
+;; exports rather than through one flat cl-user.
+(defpackage :sg.say (:use :cl :sg.core :sg.xmpp :sg.autolith))
+(in-package :sg.say)
+
 ;; real randomness for per-shot resources
 (setf *random-state* (make-random-state t))
 

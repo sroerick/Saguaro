@@ -25,7 +25,7 @@ and the helper scripts.
 
 | piece       | what                                                   |
 |-------------|--------------------------------------------------------|
-| harness/    | CL XMPP bridge + Python heartbeat/watchdog/canary + boot (MIT)|
+| harness/    | the CL bridge (`bridge.lisp` plus one library per transport in `harness/lib/`) + Python heartbeat/watchdog/canary + boot (MIT)|
 | pp_mirror/  | optional Pricklypear-backed memory store (ISC, vendored nopalito) |
 | RUNBOOK.md  | zero-to-agent install and wiring                       |
 | ENGINE_PIN  | autolith version this release is tested against        |

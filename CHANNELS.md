@@ -3,8 +3,11 @@
 Written 2026-11-10 against `lambda-symbolics/autolith` branch `lho/channels`
 at `3e87496c` (VERSION 0.67.32). The design intent behind it is
 `docs/autolith-channel-proposal.org` in that tree. This file records what the
-harness has to become. `main` stays on the pinned release until the phases
-below have landed on a scratch box.
+harness has to become.
+
+Merged into `main` on 2026-11-13, after gregor was upgraded: the branch and this
+file no longer sit aside. gregor itself runs 0.67.12, which is behind the build
+the observations below were taken on, so phases 2-5 still owe their own checks.
 
 ## The interface that replaces sessions
 
@@ -68,7 +71,7 @@ The bridge stops being a terminal driver and becomes a **channel client**:
 6. proactive agent output and mentions arrive in the person's inbox channel,
    which is what the bridge delivers to the owner surface.
 
-Concretely, in `harness/bridge.lisp` the interface seam is three verbs:
+Concretely, in `harness/lib/autolith.lisp` the interface seam is three verbs:
 
 ```
 status(channel)   -> state plist                ; al-status-records

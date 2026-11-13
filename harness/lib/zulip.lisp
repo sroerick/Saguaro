@@ -1,15 +1,64 @@
-(in-package :cl-user)
+;;;; zulip.lisp -- the Zulip surface: an events queue, the should-I-respond
+;;;; policy, and a sender that answers into the same stream and topic (or the
+;;;; same direct message).
+;;;;
+;;;; Its config section is [zulip]; its surface keyword is :zulip, and it
+;;;; registers its sender and reply policy with SG.AUTOLITH:REGISTER-SURFACE.
 
-;;;; zulip.lisp -- the Zulip surface for the saguaro bridge.
-;;;
-;;;; Loaded by bridge.lisp after its config and transport sections; uses the
-;;;; helpers defined there (cfg-str, json-parse, jget, run-capture, home-path,
-;;;; log-line, trim, now) and nothing outside them.
-;;;
-;;;; The bot listens on an events queue, decides whether a message deserves a
-;;;; turn (see ZULIP-RESPOND-P), and answers into the same stream and topic (or
-;;;; the same direct message). Outside the open streams it only answers
-;;;; mentions, messages that name it, and direct messages.
+(defpackage :SG.ZULIP
+  (:use :CL :SG.CORE :SG.AUTOLITH)
+  (:export
+   #:*ZULIP-SITE*
+   #:*ZULIP-EMAIL*
+   #:*ZULIP-RC*
+   #:*ZULIP-STREAMS*
+   #:*ZULIP-OPEN-STREAMS*
+   #:*ZULIP-NAME-WORDS*
+   #:*ZULIP-REPLY-POLICY*
+   #:*ZULIP-POLL-SECS*
+   #:*MAIN-LAST-ZULIP-POLL*
+   #:*ZULIP-CHUNK-CHARS*
+   #:*ZULIP-STATE-PATH*
+   #:*ZULIP-NETRC-PATH*
+   #:*ZULIP-ON*
+   #:ZULIP-RC-FIELD
+   #:ZULIP-SITE*
+   #:ZULIP-EMAIL*
+   #:ZULIP-HOST
+   #:ZULIP-ENSURE-NETRC
+   #:ZULIP-API
+   #:*ZULIP-STATE*
+   #:ZULIP-LOAD-STATE
+   #:ZULIP-SAVE-STATE
+   #:ZULIP-STATE
+   #:*ZULIP-BOT-IDS*
+   #:*ZULIP-BOTS-KNOWN-P*
+   #:ZULIP-FETCH-USERS
+   #:ZULIP-BOT-P
+   #:*ZULIP-OWN-NAME*
+   #:ZULIP-OWN-NAME
+   #:ZULIP-NAME-WORDS
+   #:ZULIP-EMAIL-LOCAL
+   #:ZULIP-NAMED-P
+   #:ZULIP-FLAGS
+   #:ZULIP-DIRECT-P
+   #:ZULIP-STREAM-OF
+   #:ZULIP-NORMALIZE
+   #:ZULIP-PEER
+   #:ZULIP-SPLIT
+   #:ZULIP-PEER-TARGET
+   #:ZULIP-SEND
+   #:ZULIP-DELIVER
+   #:ZULIP-REGISTER
+   #:ZULIP-POLL-ONCE
+   #:ZULIP-OPEN-STREAM-P
+   #:ZULIP-TOPIC-KEY
+   #:ZULIP-FOLLOWED-TOPIC-P
+   #:ZULIP-FOLLOW
+   #:ZULIP-RESPOND-P
+   #:ZULIP-PROMPT
+   #:ZULIP-SERVICE))
+(in-package :SG.ZULIP)
 
 (defparameter *zulip-site* (cfg-str "zulip" "site"))
 (defparameter *zulip-email* (cfg-str "zulip" "email"))
@@ -382,3 +431,13 @@
           (t
            (log-line "zulip: skipping message ~a from ~a (~a)"
                      (getf message :id) (getf message :sender) reason)))))))
+
+
+;;; ---------------------------------------------------------------------
+;;; the surface this module owns
+;;; ---------------------------------------------------------------------
+
+(register-surface :zulip
+                  :sender #'zulip-deliver
+                  :policy (cfg-str "zulip" "reply_policy")
+                  :label "ZULIP MESSAGE")

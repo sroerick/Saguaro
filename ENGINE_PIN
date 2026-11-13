@@ -1,5 +1,9 @@
 engine:    autolith (github.com/lambda-symbolics/autolith)
 tested:    v0.50.0  (in production on this stack since 2026-09-19)
-latest:    v0.60.0  (upstream release 2026-10-09; installed here, soak pending)
-next:      branch lho/channels @ 3e87496c (VERSION 0.67.32), the channel
-           interface; migration plan in CHANNELS.md
+latest:    v0.60.0  (upstream release 2026-10-09)
+channels:  branch lho/channels @ 3e87496c (VERSION 0.67.32), merged into main
+           2026-11-13; the harness now targets the channel interface
+           (migration plan and verified facts in CHANNELS.md)
+running:   gregor is on v0.67.12 as of 2026-11-13, behind the 0.67.32 the
+           channel facts were verified on; phases 2-5 in CHANNELS.md still
+           owe their own checks against that build
