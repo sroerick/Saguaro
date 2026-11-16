@@ -1,0 +1,28 @@
+#!/bin/sh
+# al-compat -- version-tolerant autolith CLI seam for the saguaro harness.
+#
+# 0.67.50 (2026-11-16) dropped the `localgroup` command group: what was
+#   autolith localgroup status|tell|pause|kill
+# is now
+#   autolith status|tell|pause|stop
+# (same protocol, same :LOCALGROUP-STATUS sexp, same session ids). The bridge,
+# watchdog, heartbeat and canary still spell the old form, so translate here
+# instead of in every call site. Falls back to the prefixed form when the
+# installed release predates 0.67.50, so one seam spans both.
+#
+# stdout, stderr and exit status pass through unchanged.
+REAL="${AL_COMPAT_REAL:-/home/al/.local/share/autolith/installation/current/bin/autolith}"
+case "$1" in
+  localgroup) shift ;;
+esac
+[ $# -gt 0 ] || exec "$REAL"
+out=$(mktemp /tmp/alcompat.XXXXXXXX) || exit 70
+err=$(mktemp /tmp/alcompat.XXXXXXXX) || exit 70
+trap "rm -f $out $err" EXIT
+"$REAL" "$@" >"$out" 2>"$err"; rc=$?
+if [ $rc -ne 0 ] && grep -q "Unknown command" "$err" 2>/dev/null; then
+  "$REAL" localgroup "$@" >"$out" 2>"$err"; rc=$?
+fi
+cat "$out"
+cat "$err" >&2
+exit $rc
