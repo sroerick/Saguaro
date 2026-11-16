@@ -659,30 +659,14 @@ def breaker_open():
     return True
 
 
-# --- proactive compaction guard (added 2026-10-10) ------------------------
-# A standing conversation on a reasoning model that cannot summarize itself
-# aborts turns once it is large: autolith runs a mid-turn compaction, the
-# summarization call comes back with no visible assistant text, and
-# PROVIDER-PROTOCOL-ERROR "Compaction produced no summary text." aborts the
-# turn BEFORE any record is written (0 assistant texts -> the bridge delivers
-# "(no text output)"). Four occurrences on 2026-10-09/10 at ~163-171K on the
-# 272K meter, model opencode/glm-5.3-flash. The manual recovery is a forced
-# `(compact)`; glm does it reliably while the conversation is small and
-# kimi-k3 does it at any size. So we compact PROACTIVELY, well below the
-# failure zone, borrowing kimi only if the pinned model cannot.
-COMPACT_AT_K = 120          # pane meter (K) at/above which we compact
-# 2026-10-11: compaction is handled INSIDE the image now (compact-model.lisp
-# borrows kimi for the compaction and restores the pinned provider). The
-# external model-switching rescue below is RETIRED by default: it hand-switched
-# models and its failure path sent C-c, which kills the whole app on autolith
-# 0.62.1. Set this True only if the in-image swap is removed or broken.
-COMPACT_RESCUE_ENABLED = False
-COMPACT_DONE_K = 40         # a compaction "worked" once the meter is below this
-COMPACT_MARK = Path.home() / ".cache" / "saguaro-compact-guard"
-COMPACT_MIN_GAP = 900       # at most one guard cycle per 15 min
-FALLBACK_MODEL = "opencode/kimi-k3"
-PICKER_HINT = "pick the reasoning effort"
-
+# --- no-text turn guard (added 2026-10-09) ---------------------------------
+#
+# RETIRED 2026-11-16 for autolith 0.67.50: the proactive compact guard, the
+# kimi model swap (/model plus the effort picker) and the C-c rescue are
+# REMOVED. 0.67.50 compacts natively (compaction.submit) and its CLI has no
+# "localgroup" command group; the old rescue switched models by hand and sent
+# C-c, which kills the whole app. What remains is diagnosis: report what
+# autolith actually said when a turn aborted, instead of guessing "compaction".
 
 def _status_raw():
     return sh([A["bin"], "localgroup", "status", "--sexp"], timeout=30).stdout
@@ -704,113 +688,40 @@ def agent_ctx_k():
     return int(m.group(1)) if m else None
 
 
-def _wait_idle(timeout=40):
-    end = time.time() + timeout
-    while time.time() < end:
-        if _status_field(_status_raw(), "STATE") == ":IDLE":
-            return True
-        time.sleep(4)
-    return False
+def recent_abort(conv):
+    """(condition-type, message) of the newest TURN-ABORTED record, or None.
 
-
-def _wait_ctx_below(target_k, timeout):
-    end = time.time() + timeout
-    while time.time() < end:
-        k = agent_ctx_k()
-        if k is not None and k <= target_k:
-            return True
-        time.sleep(5)
-    return False
-
-
-def _set_model(model, session):
-    """Switch model via the agent and answer the reasoning-effort picker."""
-    sh([A["bin"], "localgroup", "tell", session, "/model %s" % model],
-       timeout=30)
-    for _ in range(4):
-        time.sleep(3)
-        if PICKER_HINT in _pane():
-            sh(["/usr/bin/tmux", "send-keys", "-t", "alagent", "Enter"],
-               timeout=20)
-        elif _status_field(_status_raw(), "STATE") == ":IDLE":
-            break
-    _wait_idle(30)
-
-
-def _do_compact(session):
-    """Tell the agent to compact and wait for the context meter to drop.
-
-    The guard only ever calls this with the meter at/above COMPACT_AT_K, and the
-    meter holds its value until the compaction finishes (it does not flash to 0
-    mid-flight), so 'meter now below COMPACT_DONE_K' is a faithful success test.
-    On failure/timeout, abort any wedged operation with C-c and let the caller
-    escalate."""
-    sh([A["bin"], "localgroup", "tell", session, "(compact)"], timeout=30)
-    if _wait_ctx_below(COMPACT_DONE_K, 240):
-        return True
-    sh(["/usr/bin/tmux", "send-keys", "-t", "alagent", "C-c"], timeout=20)
-    time.sleep(3)
-    return False
-
-
-def rescue_compact(session):
-    """Free the standing conversation: force a compaction, borrowing kimi-k3
-    (which can summarize any size) only if the pinned model cannot."""
-    if not session or not _wait_idle(30):
-        print("watchdog: rescue_compact: session not idle; skipping",
-              flush=True)
-        return False
-    model = _status_field(_status_raw(), "MODEL")
-    ok = _do_compact(session)
-    if not ok:
-        print("watchdog: rescue_compact: %s could not compact; trying %s"
-              % (model, FALLBACK_MODEL), flush=True)
-        _set_model(FALLBACK_MODEL, session)
-        ok = _do_compact(session)
-        if model and model != FALLBACK_MODEL:
-            _set_model(model, session)
-    print("watchdog: rescue_compact: %s (model %s)"
-          % ("compacted" if ok else "FAILED", model), flush=True)
-    return ok
-
-
-def compact_guard_recent():
+    An aborted turn writes no assistant text, and the one record it does leave
+    carries :CONDITION-TYPE and :MESSAGE. Reading those is the honest way to
+    say why a turn produced nothing; the old alert guessed "compaction" every
+    time, which was wrong on 2026-11-16 (it was a provider HTTP 400)."""
+    if not conv:
+        return None
+    d = Path.home() / ".local/share/autolith/conversations" / conv
+    files = sorted(d.glob("*.sexp")) if d.is_dir() else []
+    if not files:
+        return None
     try:
-        return (time.time() - COMPACT_MARK.stat().st_mtime) < COMPACT_MIN_GAP
+        data = files[-1].read_text(errors="replace")
     except OSError:
-        return False
+        return None
+    i = data.rfind("TURN-ABORTED")
+    if i < 0:
+        return None
+    w = data[i:i + 4000]
+    ct = ""
+    m = re.search(r":CONDITION-TYPE\s+#A\(\(\d+\)\s+BASE-CHAR\s+\.\s+\"([^\"]+)\"", w)
+    if m:
+        ct = m.group(1)
+    tail = w.split(":MESSAGE", 1)[-1].split(":REQUEST-NUMBER", 1)[0]
+    tail = re.sub(r"#A\(\(\d+\)\s+BASE-CHAR\s+\.\s+", "", tail)
+    tail = tail.replace(chr(92) + chr(34), chr(39))
+    tail = tail.replace(chr(34), " ")
+    tail = re.sub(r"\s+", " ", tail).strip(" .>#<")
+    return ct, tail[:300]
 
 
-def check_compact_guard(rec):
-    """Proactively compact before the conversation reaches the size at which
-    the model can no longer summarize it. Returns True if it compacted."""
-    if not COMPACT_RESCUE_ENABLED:
-        return False
-    if compact_guard_recent():
-        return False
-    if rec.get("active") or not rec.get("idle"):
-        return False
-    k = agent_ctx_k()
-    if k is None or k < COMPACT_AT_K:
-        return False
-    print("watchdog: context at %dK (>= %dK) - proactively compacting"
-          % (k, COMPACT_AT_K), flush=True)
-    try:
-        COMPACT_MARK.parent.mkdir(parents=True, exist_ok=True)
-        COMPACT_MARK.touch()
-    except OSError:
-        pass
-    ok = rescue_compact(rec.get("session"))
-    if not ok:
-        alert("watchdog: the agent's conversation reached %dK tokens and "
-              "could NOT be auto-compacted (the compaction bug). It needs "
-              "manual eyes - rotate the standing conversation or force a "
-              "compaction under another model." % k,
-              kind="compact-guard-failed")
-    return ok
-
-
-def check_no_text_turn(rec, auto_fixed=False):
+def check_no_text_turn(rec):
     """Page the owner when the bridge reports a turn with no assistant text."""
     try:
         age = time.time() - NO_TEXT_MARK.stat().st_mtime
@@ -827,23 +738,26 @@ def check_no_text_turn(rec, auto_fixed=False):
         NO_TEXT_ALERTED.touch()
     except OSError:
         pass
-    if not auto_fixed and rec and COMPACT_RESCUE_ENABLED:
-        k = agent_ctx_k()
-        if k is not None and k >= COMPACT_AT_K:
-            auto_fixed = rescue_compact(rec.get("session"))
-    if auto_fixed:
-        msg = ("the agent's last turn produced NO assistant text (%.0f min "
-               "ago) - the known compaction failure at large context. I "
-               "auto-compacted the conversation, so it is responsive again: "
-               "just re-ask." % (age / 60.0))
+    k = agent_ctx_k()
+    ctx = "%dK" % k if k is not None else "unknown"
+    abort = recent_abort(rec.get("conversation")) if rec else None
+    if abort:
+        ct, why = abort
+        low = (ct + " " + why).lower()
+        if "compaction" in low or "no summary text" in low:
+            hint = ("That IS autolith native compaction failing - re-ask; if it "
+                    "repeats, rotate the standing conversation.")
+        else:
+            hint = ("NOT compaction: autolith aborted the turn before writing "
+                    "anything. Clear the provider/model error above, then re-ask.")
+        msg = ("the agent's last turn produced NO assistant text (%.0f min ago). "
+               "autolith: %s %s - context %s. %s"
+               % (age / 60.0, ct or "(unknown condition)", why, ctx, hint))
     else:
-        msg = ("the agent's last turn produced NO assistant text (%.0f min "
-               "ago) - a compaction failure at large context (autolith: "
-               "\"Compaction produced no summary text.\"), which aborts the "
-               "turn before it writes anything. Compaction is now borrowed to "
-               "kimi in-image; if this still happens, check "
-               "/home/al/.cache/compact-model-swap.log, then re-ask or rotate "
-               "the conversation." % (age / 60.0))
+        msg = ("the agent's last turn produced NO assistant text (%.0f min ago); "
+               "no TURN-ABORTED record in the newest chunk, so there is no "
+               "condition to report - context %s. See harness/bridge.log."
+               % (age / 60.0, ctx))
     alert(msg, kind="no-text-turn")
 
 
@@ -1091,8 +1005,7 @@ def main():
 
     # Proactively keep the conversation below the size at which the model can
     # no longer summarize it; then page about any 0-text turn (auto-fixed or not).
-    compacted = check_compact_guard(rec)
-    check_no_text_turn(rec, compacted)
+    check_no_text_turn(rec)
 
     if canary_due():
         try:
