@@ -128,6 +128,24 @@ if ! session_up alagent "autolith"; then
   tmux kill-session -t alagent 2>/dev/null || true
   tmux new-session -d -s alagent \
     "CL_EXEC_SANDBOX_PROCESS_GROUP_HELPER=$SB_HELPER AUTOLITH_COMPACTION_THRESHOLD=80 AUTOLITH_CONTEXT_WINDOW=524288 $LAUNCH --permissions full 2>&1"
+
+  # Dismiss the boot splash (autolith 0.67.50, 2026-11-16). After an update the
+  # TUI lands on "SPACE: onboarding / ESCAPE: Lisp listener" and stays there:
+  # channel input submitted with `tell` is QUEUED but the reader does not run
+  # it until a key is pressed. An unattended watchdog restart would therefore
+  # leave the agent idle-looking with a growing queue. ESCAPE enters the Lisp
+  # listener; extra escapes in the listener are harmless, so poll briefly and
+  # stop as soon as the composer is up.
+  i=0
+  while [ "$i" -lt 15 ]; do
+    i=$((i + 1))
+    sleep 3
+    pane=$(tmux capture-pane -p -t alagent 2>/dev/null || true)
+    case "$pane" in
+      *"Ask Autolith anything"*) break ;;
+      *"ESCAPE: Lisp listener"*) tmux send-keys -t alagent Escape 2>/dev/null || true ;;
+    esac
+  done
 fi
 
 # Bridge engine (2026-09-27): the Common Lisp bridge is the default; set
