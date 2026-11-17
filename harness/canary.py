@@ -47,6 +47,17 @@ REPLY_SECS = float(B.get("canary_reply_secs", 1800))
 # (watchdog.canary_due), so this is an outer bound, not the check interval.
 REPLY_SECS = max(REPLY_SECS, PING_SECS + 600)
 
+# 2026-11-17: TRANSPORT fault. A tokenized ping that never even lands in the
+# conversation (no record carries the token) while the session is IDLE is not
+# a slow turn - the bridge is not receiving XMPP. On 2026-11-17 that state
+# lasted about two hours: the TCP socket stayed ESTABLISHED and keepalive/ping
+# pongs kept the bridge stale-stream guard happy, while no message was
+# delivered. Waiting the full REPLY_SECS window (70 min) is what made it
+# invisible, so an idle session plus an old, never-delivered ping now returns
+# TRANSPORT_FAULT (exit 3) and the watchdog restarts the bridge.
+TRANSPORT_FAULT = 3
+TRANSPORT_SECS = float(B.get("canary_transport_secs", 180))
+
 
 def bridge_pid():
     """The bridge's python process id. The tmux pane leader is a ksh
@@ -263,6 +274,15 @@ def main():
                 print("canary: round-trip ok (%s, %.0f min)"
                       % (detail, age / 60.0), flush=True)
                 return 0
+            # Never delivered at all, session idle => inbound XMPP is dead.
+            if (detail.startswith("token %s never reached" % token)
+                    and age >= TRANSPORT_SECS
+                    and not any(r.get("active") for r in recs)):
+                print("canary: TRANSPORT ping %s never reached %s after "
+                      "%.0fs and the session is idle - inbound XMPP is not "
+                      "being delivered" % (token, conv, age), flush=True)
+                CANARY_PENDING.unlink()
+                return TRANSPORT_FAULT
             if age > REPLY_SECS:
                 fail("reply: %s (%.0f min old; canary room: no %s reply in "
                      "the last %d message(s))"
