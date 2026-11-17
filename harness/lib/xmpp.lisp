@@ -187,7 +187,15 @@ never is the transport command line itself."
     (xmpp-stream-header)
     (xmpp-authenticate)
     (xmpp-bind)
-    (xmpp-send "<presence><priority>0</priority></presence>")
+    ;; 2026-11-17: presence priority 0 -> 10. RFC 6121 routes a DM to the
+    ;; highest-priority available resource, so at priority 0 ANY other session
+    ;; of this JID (a leftover one-shot say.lisp/canary sender, a client
+    ;; logged into the account) silently takes the owner's messages while the
+    ;; bridge looks perfectly connected - that is the 2026-11-17 "inbound went
+    ;; dead, socket healthy" outage. The bridge is the standing resource, so
+    ;; it should win; configurable via [bridge] xmpp_priority.
+    (xmpp-send (format nil "<presence><priority>~d</priority></presence>"
+                       (cfg-int "bridge" "xmpp_priority" 10)))
     (dolist (muc (cfg-list "bridge" "mucs"))
       (xmpp-join-muc muc))
     (setf *last-inbound* (now))

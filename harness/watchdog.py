@@ -761,6 +761,32 @@ def check_no_text_turn(rec):
     alert(msg, kind="no-text-turn")
 
 
+def handle_canary_transport_fault():
+    """The canary proved the bridge is not receiving XMPP (a tokenized ping
+    never reached an idle conversation) while its socket still looks healthy:
+    keepalive pongs satisfy the bridge stale-stream guard, so nothing else
+    notices. Restart the bridge and page the owner, because messages sent in
+    that window are dropped server-side and must be resent.
+    Returns True when the bridge was restarted successfully."""
+    if bridge_restart_recent():
+        print("watchdog: canary transport fault; a bridge restart is recent "
+              "- skipping this cycle", flush=True)
+        return False
+    ok = restart_bridge(
+        "canary: an idle session never received the tokenized ping - "
+        "inbound XMPP is dead")
+    if ok:
+        alert("watchdog: the bridge stopped receiving XMPP messages (its "
+              "socket still looked connected), so any DM you sent recently "
+              "may have been dropped. I restarted the bridge - please resend "
+              "anything unanswered.", kind="bridge-transport")
+    else:
+        alert("watchdog: the bridge is NOT receiving XMPP messages and I "
+              "could not restart it. DMs are being dropped - needs eyes.",
+              kind="bridge-transport", critical=True)
+    return ok
+
+
 def bridge_restart_recent():
     try:
         return (time.time() - BRIDGE_RESTART_MARK.stat().st_mtime) < BRIDGE_RESTART_MIN_GAP
@@ -769,14 +795,15 @@ def bridge_restart_recent():
 
 
 def restart_bridge(reason):
+    """Restart the XMPP bridge. Returns True only when it came back up."""
     if not probes_ok():
         print("watchdog: a probe failed this cycle (%s) - NOT restarting "
               "bridge (%s)" % (_SH_FAIL, reason), flush=True)
-        return
+        return False
     if breaker_open():
         print("watchdog: breaker open - NOT restarting bridge (%s)" % reason,
               flush=True)
-        return
+        return False
     print("watchdog: %s -> restarting xmpp-bridge" % reason, flush=True)
     incident("bridge-restart", reason)
     sh(["/usr/bin/tmux", "kill-session", "-t", "xmpp-bridge"], timeout=30)
@@ -796,6 +823,7 @@ def restart_bridge(reason):
               kind="bridge-restart-failed")
     else:
         print("watchdog: bridge restarted cleanly (quiet; no push)", flush=True)
+    return back
 
 
 CANARY_PENDING_MARK = Path.home() / ".cache" / "saguaro-canary-pending"
@@ -1011,7 +1039,9 @@ def main():
         try:
             import canary   # lazy: a broken canary must not break the watchdog
             code = canary.main()
-            if code:
+            if code == getattr(canary, "TRANSPORT_FAULT", 3):
+                handle_canary_transport_fault()
+            elif code:
                 print("watchdog: canary exited %s" % code, flush=True)
         except Exception as e:
             print("watchdog: canary run failed: %s" % e, flush=True)
