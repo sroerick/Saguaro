@@ -48,7 +48,4 @@ Short version; details in RUNBOOK.md:
 
 ## License
 
-- `harness/` and top level: MIT (c) 2026 roerick
-- `pp_mirror/`: ISC, vendored from the Pricklypear repo -- see pp_mirror/VENDORED.md
-- The autolith engine is ISC (c) Lambda Symbolics OUE; it is not included
-  in this repo -- see ENGINE_PIN.
+do not use this software pls thx 
